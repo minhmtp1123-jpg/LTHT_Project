@@ -7,7 +7,7 @@ Một chat server đơn tiến trình, đơn luồng, phục vụ **đồng th�
 Kèm chương trình **benchmark** so sánh độ trễ và thông lượng của các cơ chế IPC:
 pipe, Unix stream, Unix datagram, Unix seqpacket và TCP loopback.
 
-## Mục lục
+## Mục lụca
 
 1. [Socket trong bức tranh IPC](#1-socket-trong-bức-tranh-ipc)
 2. [Kiến trúc](#2-kiến-trúc)

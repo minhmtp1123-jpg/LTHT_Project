@@ -9,7 +9,7 @@ SAN     := -fsanitize=address,undefined
 all: server client bench
 
 server: server.c
-	$(CC) $(WARN) $(OPT) -o $@ $<
+	$(CC) $(WARN) $(OPT) -o $@ $< -lcrypt
 
 client: client.c
 	$(CC) $(WARN) $(OPT) -o $@ $<
@@ -19,7 +19,7 @@ bench: bench.c
 
 # Ban debug cho server/client (ASan + UBSan) de phat hien loi bo nho
 debug:
-	$(CC) $(WARN) -g $(SAN) -o server server.c
+	$(CC) $(WARN) -g $(SAN) -o server server.c -lcrypt
 	$(CC) $(WARN) -g $(SAN) -o client client.c
 
 bench-run: bench
