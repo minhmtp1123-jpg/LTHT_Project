@@ -4,10 +4,13 @@
 
 Một chat server đơn tiến trình, đơn luồng, phục vụ **đồng thời** client kết nối qua
 **Unix domain socket** (`AF_UNIX`) và **TCP** (`AF_INET`) bằng cơ chế `epoll` non-blocking.
+Client phải **đăng nhập bằng username và mật khẩu** mới vào được phòng: tài khoản lưu trong file
+`users.db` (mật khẩu được băm, không lưu dạng thô), mọi tin nhắn công khai được ghi vào `chat.log`
+và gửi lại cho người vừa đăng nhập.
 Kèm chương trình **benchmark** so sánh độ trễ và thông lượng của các cơ chế IPC:
 pipe, Unix stream, Unix datagram, Unix seqpacket và TCP loopback.
 
-## Mục lụca
+## Mục lục
 
 1. [Socket trong bức tranh IPC](#1-socket-trong-bức-tranh-ipc)
 2. [Kiến trúc](#2-kiến-trúc)
@@ -127,18 +130,75 @@ Mỗi tin nhắn là một **frame** với tiền tố độ dài (*length-prefi
 - Server **ngắt** client nếu `len == 0` hoặc `len > 4096` (chống client gửi độ dài giả để ép server cấp bộ nhớ).
 - Vì TCP và `SOCK_STREAM` là dòng byte, một frame có thể đến thành nhiều mẩu, hoặc nhiều frame đến chung một lần `read()`. Cả server lẫn client đều gom byte vào buffer rồi mới tách frame.
 
-### Lệnh
+### Xác thực
+
+Vừa kết nối, client ở trạng thái **chưa đăng nhập**: server chỉ chấp nhận hai lệnh dưới đây,
+mọi thứ khác bị từ chối và client không nhận được tin của phòng.
+
+| Lệnh | Tác dụng | Phản hồi |
+|---|---|---|
+| `/login <tên> <mật khẩu>` | Đăng nhập tài khoản đã có | `+OK <tên>` hoặc `-ERR <lý do>` |
+| `/register <tên> <mật khẩu>` | Tạo tài khoản mới rồi đăng nhập luôn | `+OK <tên>` hoặc `-ERR <lý do>` |
+
+```mermaid
+sequenceDiagram
+    participant C as client
+    participant S as server
+    S->>C: Cần đăng nhập, gửi ngay khi vừa kết nối
+    C->>S: /login alice mật khẩu, hoặc /register
+    Note over S: Tìm tài khoản trong users.db.<br/>crypt_r so khớp với hash đã lưu.<br/>Luôn tính crypt, kể cả khi sai tên.
+    alt Đúng
+        S->>C: +OK alice
+        S->>C: Lời chào và 20 dòng lịch sử gần nhất
+        Note over S: Ghi alice vào phòng vào chat.log,<br/>báo cho những người khác.
+    else Sai
+        S->>C: -ERR Sai tên đăng nhập hoặc mật khẩu
+        Note over C,S: Sai 3 lần thì server ngắt kết nối.<br/>Im lặng quá 30 giây cũng bị ngắt.
+    end
+```
+
+- Tên đăng nhập chỉ gồm `A-Z a-z 0-9 _`, tối đa 16 ký tự. Mật khẩu dài 6 đến 72 ký tự và được phép chứa dấu cách (nhưng không có dấu cách ở cuối).
+- Lỗi đăng nhập luôn là một câu chung ("Sai tên đăng nhập hoặc mật khẩu"), không cho biết tên có tồn tại hay không.
+- Một tài khoản chỉ đăng nhập ở một nơi tại một thời điểm.
+- Client (`./client`) tự lo bước này: hỏi tên và mật khẩu (ẩn ký tự khi gõ), gửi lệnh, đợi `+OK`, và hỏi lại nếu bị từ chối.
+
+### Lệnh trong phòng chat (sau khi đăng nhập)
 
 | Nhập | Tác dụng |
 |---|---|
-| `nội dung bất kỳ` | Gửi cho mọi người (broadcast) |
-| `/nick <tên>` | Đổi tên. Chỉ chứa `A-Z a-z 0-9 _`, tối đa 16 ký tự, không trùng người khác |
+| `nội dung bất kỳ` | Gửi cho mọi người (broadcast), có ghi vào lịch sử |
 | `/list` | Liệt kê người đang online kèm loại kết nối (`unix` hoặc `tcp`) |
-| `/msg <tên> <nội dung>` | Tin nhắn riêng |
+| `/msg <tên> <nội dung>` | Tin nhắn riêng, **không** ghi vào lịch sử |
 | `/help` | Xem danh sách lệnh |
 | `/quit` | Thoát |
 
-Tên mặc định khi vừa kết nối là `user<fd>`.
+Tên hiển thị chính là tên đăng nhập, nên không còn lệnh đổi tên.
+
+### Tệp dữ liệu
+
+Cả hai tệp được tạo tự động ở lần chạy đầu với quyền `0600`. Nếu tệp đã có với quyền rộng hơn,
+server cảnh báo và đặt lại `0600`.
+
+**`users.db`**: mỗi dòng một tài khoản, dạng `tên:hash`. Hash do `crypt(3)` của libxcrypt sinh ra
+(mặc định **yescrypt**, có salt ngẫu nhiên riêng cho mỗi tài khoản, dự phòng SHA-512), nên mật khẩu
+thô không bao giờ nằm trong file. Dòng trống, dòng bắt đầu bằng `#` và dòng sai định dạng bị bỏ qua.
+
+```
+alice:$y$j9T$L16jR0fC.kpZOS4528a7rxUUF7hop...
+bob:$y$j9T$B4o5/ei8MyjbDKokJZ...
+```
+
+**`chat.log`**: mỗi dòng một sự kiện, ba cột ngăn bằng tab: thời gian, người gửi, nội dung.
+Người gửi là `*` với sự kiện hệ thống (vào hoặc rời phòng). Ký tự điều khiển trong nội dung
+được đổi thành dấu cách để một tin nhắn không thể chèn thêm dòng giả vào file.
+
+```
+2026-10-25 15:43:40	*	carol vao phong
+2026-10-25 15:43:40	carol	xin chao tu carol
+2026-10-25 15:43:40	*	carol roi phong
+```
+
+Khi đăng nhập, server đọc phần cuối của `chat.log` và gửi lại tối đa 20 dòng gần nhất cho người đó.
 
 ---
 
@@ -151,9 +211,15 @@ Tên mặc định khi vừa kết nối là `user<fd>`.
 ├── client.c       poll() trên stdin + socket (Unix hoặc TCP)
 ├── bench.c        benchmark độ trễ và thông lượng các cơ chế IPC
 ├── plot.py        vẽ biểu đồ từ results.csv
-├── docs/          ảnh sơ đồ kiến trúc (architecture, event-loop, message-flow) cho báo cáo và slide
+├── docs/          ảnh sơ đồ (architecture, event-loop, message-flow, auth-flow) cho báo cáo và slide
 └── README.md
+
+Tạo ra khi chạy (không đưa vào git):
+├── users.db       tài khoản: tên:hash
+└── chat.log       lịch sử trò chuyện
 ```
+
+> Nên thêm `users.db` và `chat.log` vào `.gitignore` để không đẩy tài khoản và tin nhắn lên kho mã.
 
 ---
 
@@ -166,6 +232,8 @@ sudo pacman -S base-devel gdb valgrind strace socat tmux python-matplotlib
 ```
 
 `python-matplotlib` chỉ cần cho `plot.py`; các gói còn lại phục vụ build, gỡ lỗi và demo.
+Server còn cần thư viện `libxcrypt` (liên kết bằng `-lcrypt`, Arch thường đã cài sẵn cùng `base`);
+nếu thiếu `crypt.h` khi build thì cài `libxcrypt`.
 
 ### Build
 
@@ -180,13 +248,14 @@ make clean
 ### Chạy
 
 ```bash
-./server                          # Unix: /tmp/chat.sock   TCP: cổng 9000
-./server /tmp/x.sock 9100         # chỉ định đường dẫn và cổng
+./server                          # Unix: /tmp/chat.sock, TCP: cổng 9000, users.db, chat.log
+./server -u /tmp/x.sock -p 9100 -d users.db -l chat.log    # chỉ định từng tham số
 
-./client unix                     # kết nối /tmp/chat.sock
+./client -r unix                  # ĐĂNG KÝ tài khoản mới (hỏi mật khẩu 2 lần)
+./client unix                     # đăng nhập, kết nối /tmp/chat.sock
 ./client unix /tmp/x.sock
-./client tcp                      # 127.0.0.1:9000
-./client tcp 192.168.1.10 9000
+./client tcp                      # đăng nhập qua TCP 127.0.0.1:9000
+./client -r tcp 192.168.1.10 9000
 ```
 
 Dừng server bằng `Ctrl+C`: server đóng toàn bộ kết nối, giải phóng bộ nhớ và `unlink` file socket.
@@ -201,16 +270,28 @@ Dùng `tmux` hoặc mở 5 terminal.
 
 ```bash
 ./server                        # terminal 1
-./client unix                   # terminal 2
-./client unix                   # terminal 3
-./client tcp                    # terminal 4
+./client -r unix                # terminal 2: đăng ký alice
+./client -r unix                # terminal 3: đăng ký bob
+./client -r tcp                 # terminal 4: đăng ký carol
 ```
 
 Log của server hiển thị loại kết nối và danh tính đối phương, ví dụ
 `unix pid=1157 uid=1000` (lấy bằng `SO_PEERCRED`) hoặc `tcp 127.0.0.1:47956`.
+Khi gõ mật khẩu, terminal không hiện ký tự nào.
 
-**Bước 2. Chat**: đổi tên (`/nick alice`), nhắn chung, `/list`, `/msg bob xin chào`.
+**Bước 2. Chat**: nhắn chung, `/list`, `/msg bob xin chào`.
 Điểm cần chỉ ra: client Unix và client TCP **cùng một phòng**.
+
+**Bước 2b. Tài khoản và lịch sử**
+
+```bash
+cat users.db            # chỉ có hash ($y$...), không có mật khẩu thật
+cat chat.log            # thời gian, người gửi, nội dung; không có tin /msg
+./client unix           # thoát rồi đăng nhập lại: hiện 20 dòng lịch sử gần nhất
+./client unix           # nhập sai mật khẩu: báo lỗi chung, sai 3 lần bị ngắt
+```
+
+Dừng server bằng `Ctrl+C`, chạy lại: tài khoản và lịch sử vẫn còn vì nằm trong file.
 
 **Bước 3. Chứng minh server chịu lỗi**: trong một terminal khác chạy `kill -9 <pid của một client>`.
 Server ghi log "đóng kết nối", thông báo cho những người còn lại và **không crash**.
@@ -238,8 +319,9 @@ printf '\x00\x00\x00\x05hello' | socat -t1 - UNIX-CONNECT:/tmp/chat.sock
 ```
 
 Lần đầu `socat` bị ngắt vì 4 byte đầu `hell` được đọc thành một độ dài khổng lồ (vượt 4096),
-log server ghi "frame không hợp lệ". Lần thứ hai là frame hợp lệ nên được chấp nhận.
-Điều này minh họa vì sao cần framing và vì sao phải kiểm tra độ dài.
+log server ghi "frame không hợp lệ". Lần thứ hai là frame hợp lệ nên được chấp nhận ở tầng giao thức,
+nhưng vì chưa đăng nhập nên server trả `-ERR Chua dang nhap...`.
+Điều này minh họa vì sao cần framing, vì sao phải kiểm tra độ dài, và rằng xác thực là một lớp riêng.
 
 **Bước 6. Benchmark**: chiếu biểu đồ độ trễ và thông lượng (xem mục sau).
 
@@ -281,13 +363,21 @@ Môi trường máy ảo thường cho số nhiễu và không phản ánh phầ
 5. **Level-triggered**, mỗi sự kiện chỉ `read()` một lượt cho mỗi client. Cách này đơn giản và công bằng giữa các client. Nếu chuyển sang edge-triggered thì bắt buộc phải đọc đến khi gặp `EAGAIN`.
 6. **Chi tiết hệ thống**: `accept4` với `SOCK_NONBLOCK | SOCK_CLOEXEC`; `MSG_NOSIGNAL` cùng bỏ qua `SIGPIPE`; `SO_REUSEADDR` cho cổng TCP; `unlink` file socket cũ trước khi `bind` và khi thoát; kiểm tra độ dài `sun_path`; `TCP_NODELAY`; `SO_PEERCRED` để ghi PID/UID của client Unix; `SIGINT`/`SIGTERM` đặt cờ dừng (không dùng `SA_RESTART` để `epoll_wait` trả về `EINTR`).
 7. **Client** dùng `poll()` trên stdin và socket, đọc stdin bằng `read()` chứ không dùng stdio để tránh dữ liệu nằm kẹt trong buffer của stdio mà `poll()` không thấy.
+8. **Lưu mật khẩu.** Server không bao giờ lưu mật khẩu thô: `make_hash()` sinh salt ngẫu nhiên bằng `getrandom` rồi băm bằng `crypt_r` (yescrypt, chi phí tính toán cao để chống dò mật khẩu hàng loạt khi file bị lộ). `verify_pass()` so khớp bằng phép so sánh thời gian cố định. Với tên không tồn tại, server vẫn tính một lần `crypt` với hash giả để thời gian phản hồi không tiết lộ tên nào có thật.
+9. **Trạng thái đăng nhập từng client** (`authed`, `auth_fails`, `connected_at`). Client chưa đăng nhập không nhận broadcast, không có trong `/list`, và bị ngắt sau 3 lần sai hoặc sau 30 giây im lặng. `epoll_wait` dùng timeout 1 giây để định kỳ dọn các kết nối này.
+10. **Dọn dấu vết mật khẩu trong bộ nhớ.** Sau khi xử lý mỗi frame, server `explicit_bzero` bản sao tin nhắn và vùng đã dùng của `rbuf`; client xóa mật khẩu khỏi bộ nhớ ngay sau khi gửi. Mật khẩu không bao giờ được ghi vào log hay `chat.log`.
+11. **Lịch sử.** `chat.log` được mở `O_APPEND` và mỗi dòng ghi bằng đúng một lần `write()`, nên mỗi dòng được nối vào cuối file nguyên vẹn. Khi đăng nhập, server chỉ `pread` 32 KiB cuối file rồi lấy 20 dòng cuối, nên thời gian không tăng theo kích thước lịch sử.
+12. **Tài khoản mới** được ghi vào `users.db` bằng một lần `write()` kèm `fsync()` trước khi thêm vào bảng trong bộ nhớ, nên server dừng đột ngột cũng không mất tài khoản vừa tạo.
 
 ---
 
 ## 9. Hạn chế
 
 - Chỉ có một luồng: một `handle_message` chậm sẽ làm chậm tất cả. Với quy mô đồ án thì không ảnh hưởng.
-- Không có xác thực, mã hóa (TLS) hay lưu lịch sử tin nhắn.
+- **Không có mã hóa (TLS).** Mật khẩu đi qua socket dưới dạng văn bản thô. Với Unix socket thì chỉ các tiến trình cùng máy thấy được; với TCP, ai nghe được đường truyền sẽ thấy cả mật khẩu và tin nhắn. Chỉ nên dùng TCP trong mạng tin cậy hoặc qua tunnel (SSH, WireGuard); hướng phát triển là thêm TLS (OpenSSL).
+- Mỗi lần kiểm tra mật khẩu tốn khoảng 10 đến 15 ms CPU (yescrypt mặc định) và chạy ngay trong vòng lặp `epoll`, nên một client liên tục đoán mật khẩu làm chậm cả server. Server mới giới hạn 3 lần sai mỗi kết nối, chưa giới hạn theo địa chỉ IP.
+- Chưa có đổi mật khẩu, xóa tài khoản, phân quyền (admin) hay giới hạn dung lượng `chat.log` (file chỉ lớn dần).
+- Bảng tài khoản nằm trong RAM và tra cứu tuần tự, phù hợp vài trăm đến vài nghìn tài khoản.
 - Server chỉ lắng nghe IPv4. Client dùng `getaddrinfo` nên kết nối được IPv4 hoặc IPv6 nếu server hỗ trợ.
 - File socket được `chmod 0666`, tức mọi user trên máy đều kết nối được. Phù hợp để demo, không phù hợp cho môi trường nhiều người dùng.
 - Benchmark dùng `socketpair`, không phải `bind` vào file `.sock`. Đường dữ liệu trong kernel giống nhau nên số đo không đổi, chỉ khác cách dựng kênh.
@@ -303,4 +393,10 @@ Môi trường máy ảo thường cho số nhiễu và không phản ánh phầ
 | Client báo `connect(unix): No such file or directory` | Server chưa chạy hoặc khác đường dẫn socket |
 | Client báo `connect(unix): Connection refused` | File socket còn sót nhưng không có tiến trình lắng nghe. Chạy lại server (server tự `unlink` file cũ) |
 | Dùng `nc` hoặc `socat` gõ chữ thô thì bị ngắt | Đúng thiết kế: giao thức yêu cầu tiền tố độ dài 4 byte. Dùng `./client`, hoặc xem bước 5 ở mục demo |
+| `fatal error: crypt.h: No such file or directory` hoặc `cannot find -lcrypt` | Thiếu `libxcrypt`: `sudo pacman -S libxcrypt` |
+| Client báo `Loi: Sai ten dang nhap hoac mat khau` | Sai tên hoặc mật khẩu, hoặc tài khoản chưa có (chạy `./client -r ...` để đăng ký). Sai 3 lần thì bị ngắt, chạy lại client |
+| Client báo `Ten dang nhap da ton tai` khi đăng ký | Tên đã có trong `users.db`, chọn tên khác |
+| Client báo `Tai khoan dang duoc dung o noi khac` | Tài khoản đang đăng nhập ở một client khác; thoát client đó trước |
+| Quên mật khẩu | Chưa có chức năng đặt lại. Dừng server, xóa dòng của tài khoản trong `users.db`, chạy lại server rồi đăng ký lại tên đó (bảng tài khoản chỉ được nạp lúc khởi động) |
+| Server in `canh bao: users.db co quyen 0644` | File cũ có quyền rộng hơn; server tự đặt lại `0600`, không cần làm gì thêm |
 | Số benchmark nhảy lung tung | Máy ảo, máy đang tải, hoặc chạy bản có sanitizer. Build lại bằng `make` và chạy lúc máy rảnh |
