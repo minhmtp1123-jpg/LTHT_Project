@@ -1,0 +1,24 @@
+# Binaries
+src/server
+src/client
+src/bench
+server
+client
+bench
+*.o
+*.out
+*.exe
+
+# Runtime files & databases
+src/users.db
+src/chat.log
+users.db
+chat.log
+*.sock
+
+# Temporary & Editor files
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/

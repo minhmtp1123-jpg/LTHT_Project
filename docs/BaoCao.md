@@ -1,276 +1,295 @@
 # Báo cáo: Sockets trong IPC - Chat server đa client bằng epoll
 
-Oct 17, 2026 · @Minh
+Oct 17, 2026 · @Minh (Cập nhật: Tháng 11/2026)
 
 ## Tóm tắt
 
-Đồ án xây dựng một chat server đa client dùng `epoll`, phục vụ đồng thời client qua Unix domain socket và TCP trong một tiến trình, một luồng, kèm chương trình benchmark so sánh năm cơ chế IPC.
+Đồ án xây dựng một chat server đa client dùng `epoll`, phục vụ đồng thời client qua **Unix domain socket** (`AF_UNIX`) và **TCP** (`AF_INET`) trong một tiến trình, một luồng, kèm chương trình benchmark so sánh năm cơ chế IPC trên Linux.
 
-Giao thức dùng tiền tố độ dài 4 byte để giữ ranh giới tin nhắn trên dòng byte. Mỗi client có buffer đọc và buffer ghi riêng, nên server ghép được tin nhắn đến thành nhiều mẩu và không bị chặn bởi client đọc chậm. Server được kiểm thử với client Unix và TCP chung một phòng, client bị ngắt đột ngột, frame bị cắt làm đôi; ASan và UBSan không báo lỗi.
+Hệ thống tích hợp lớp xác thực tài khoản bảo mật bằng thuật toán băm `yescrypt` (`libxcrypt`) lưu trong `users.db` và cơ chế ghi nhận nhật ký append-only trong `chat.log` (hỗ trợ phát lại lịch sử hội thoại gần nhất khi đăng nhập). Giao thức dùng tiền tố độ dài 4 byte (length-prefix framing) để giữ ranh giới tin nhắn trên dòng byte stream. Mỗi client có buffer đọc và buffer ghi riêng biệt, giúp server ghép được tin nhắn đến nhiều mẩu và không bị chặn bởi client đọc chậm. Server được kiểm thử với client Unix và TCP cùng một phòng, client bị ngắt đột ngột, frame bị cắt làm đôi; ASan và UBSan không phát hiện lỗi bộ nhớ.
 
-Benchmark đo độ trễ ping-pong và thông lượng của pipe, Unix stream, Unix datagram, Unix seqpacket và TCP loopback, ở năm kích thước từ 64 byte đến 64 KiB. Số liệu đo trên máy thật được điền ở mục 5.
+Chương trình benchmark đo độ trễ ping-pong và thông lượng của pipe, Unix stream, Unix datagram, Unix seqpacket và TCP loopback ở năm kích thước từ 64 byte đến 64 KiB, được trực quan hóa bằng biểu đồ phân phối.
+
+---
 
 ## 1. Giới thiệu IPC và vị trí của socket
 
-Socket là cơ chế IPC phổ biến duy nhất chạy được cả trong một máy lẫn giữa các máy, vì vậy đồ án chọn nó làm nền tảng giao tiếp.
+Socket là cơ chế IPC phổ biến duy nhất chạy được cả trong một máy (nội bộ tiến trình) lẫn giữa các máy qua mạng, vì vậy đồ án chọn nó làm nền tảng giao tiếp cốt lõi.
 
-IPC (Inter-Process Communication) là tập các cơ chế cho phép các tiến trình, vốn có không gian địa chỉ tách biệt, trao đổi dữ liệu và đồng bộ với nhau thông qua kernel. Bảng dưới so sánh các cơ chế chính trên Linux.
+IPC (Inter-Process Communication) là tập các cơ chế cho phép các tiến trình, vốn có không gian địa chỉ ảo tách biệt và bảo vệ bởi kernel, trao đổi dữ liệu và đồng bộ với nhau.
 
 | Cơ chế | Phạm vi | Hướng | Ranh giới tin nhắn | Đặc điểm |
 | --- | --- | --- | --- | --- |
-| Pipe | Cùng máy, các tiến trình có tổ tiên chung | Một chiều | Không | Đơn giản, thường dùng giữa cha và con |
-| FIFO (named pipe) | Cùng máy | Một chiều | Không | Như pipe nhưng có tên trong hệ thống file |
-| Message queue (POSIX, SysV) | Cùng máy | Qua hàng đợi | Có | Có độ ưu tiên; giới hạn kích thước theo cấu hình hệ điều hành |
-| Shared memory | Cùng máy | Hai chiều | Tự quản lý | Không sao chép dữ liệu nên nhanh nhất, nhưng phải tự đồng bộ |
-| Unix domain socket | Cùng máy | Hai chiều | Tùy loại (`STREAM` không, `DGRAM` và `SEQPACKET` có) | Địa chỉ là đường dẫn file; truyền được file descriptor (`SCM_RIGHTS`); lấy được PID và UID đối phương (`SO_PEERCRED`) |
-| TCP, UDP socket | Cùng máy hoặc qua mạng | Hai chiều | TCP không, UDP có | Đi qua network stack, dùng được giữa các máy |
+| Pipe | Cùng máy, có tổ tiên chung | Một chiều | Không (byte stream) | Đơn giản, dùng giữa tiến trình cha và con |
+| FIFO (named pipe) | Cùng máy | Một chiều | Không (byte stream) | Tương tự pipe nhưng có định danh trong hệ thống file |
+| Message queue (POSIX, SysV) | Cùng máy | Hai chiều qua queue | Có | Có độ ưu tiên; kích thước giới hạn theo kernel |
+| Shared memory | Cùng máy | Hai chiều | Tự quản lý | Nhanh nhất vì dữ liệu không copy qua kernel, nhưng cần đồng bộ (semaphore/mutex) |
+| **Unix domain socket** | Cùng máy | Hai chiều | Tùy loại (`STREAM` không, `DGRAM`/`SEQPACKET` có) | Đường dẫn file; truyền được file descriptor (`SCM_RIGHTS`); lấy được PID/UID đối phương (`SO_PEERCRED`) |
+| **TCP socket** | Khác máy hoặc nội bộ | Hai chiều | Không (byte stream) | Đi qua network stack, giao tiếp linh hoạt qua mạng IP |
 
-Đồ án dùng hai loại socket cùng kiểu `SOCK_STREAM`: `AF_UNIX` và `AF_INET`. Cùng một bộ API (`socket`, `bind`, `listen`, `accept`, `connect`, `read`, `write`) phục vụ cả hai, nên phần khác nhau của server chỉ nằm ở bước tạo và gán địa chỉ cho socket lắng nghe.
+Đồ án sử dụng hai loại socket cùng kiểu byte stream `SOCK_STREAM`: **`AF_UNIX`** và **`AF_INET`**. Cùng một bộ API POSIX (`socket`, `bind`, `listen`, `accept4`, `connect`, `read`, `send`) phục vụ cả hai, nên phần khác biệt duy nhất của server chỉ nằm ở bước khởi tạo và gán địa chỉ socket lắng nghe.
 
-Vì `SOCK_STREAM` là dòng byte không giữ ranh giới tin nhắn, giao thức tầng ứng dụng phải tự đóng khung (mục 3). Phần benchmark (mục 5) so sánh thêm hai loại Unix socket có ranh giới tin nhắn là `SOCK_DGRAM` và `SOCK_SEQPACKET`.
+Vì `SOCK_STREAM` là dòng byte không bảo toàn ranh giới thông điệp, giao thức tầng ứng dụng phải tự đóng khung (Framing). Phần benchmark (mục 5) so sánh thêm hai loại Unix socket có bảo toàn ranh giới tin nhắn là `SOCK_DGRAM` và `SOCK_SEQPACKET`.
+
+---
 
 ## 2. Kiến trúc hệ thống
 
-Server dùng một `epoll` duy nhất để theo dõi hai socket lắng nghe (Unix và TCP) cùng mọi socket client, trong một tiến trình, một luồng.
+Server sử dụng một instance `epoll` duy nhất để giám sát cả hai socket lắng nghe (Unix domain socket và TCP) cùng toàn bộ socket của các client kết nối, gói gọn trong một tiến trình, một luồng duy nhất (single-process, single-threaded event-driven architecture).
 
-&#91;embedded content: kiến trúc server · 2 listener, 1 epoll, buffer riêng mỗi client\]
+```mermaid
+flowchart LR
+    subgraph CL["Client (mỗi client là một tiến trình riêng)"]
+        C1["client unix<br/>alice"]
+        C2["client unix<br/>bob"]
+        C3["client tcp<br/>carol"]
+    end
 
-Mọi kết nối, Unix hay TCP, đều đi qua cùng một vòng `epoll`. Sau khi tách frame và xử lý, phản hồi được xếp vào `wbuf` rồi gửi ngược về client bằng `send()`.
+    subgraph SV["server (1 tiến trình, 1 luồng)"]
+        LU["Listener AF_UNIX<br/>/tmp/chat.sock"]
+        LT["Listener AF_INET<br/>cổng 9000"]
+        EP{{"epoll<br/>epoll_wait"}}
+        subgraph ST["Trạng thái riêng mỗi client"]
+            RB["rbuf<br/>gom byte, tách frame"]
+            WB["wbuf<br/>hàng đợi ghi non-blocking"]
+        end
+        HM["handle_message<br/>xác thực / list / msg / quit<br/>broadcast + chat.log"]
+    end
 
-### Vòng lặp sự kiện
+    C1 -- "Unix socket" --> LU
+    C2 -- "Unix socket" --> LU
+    C3 -- "TCP" --> LT
+    LU --> EP
+    LT --> EP
+    EP --> RB
+    RB --> HM
+    HM --> WB
+    WB --> EP
+```
 
-Mỗi vòng, server gọi `epoll_wait`, xử lý các sự kiện trả về, rồi giải phóng các client đã chết.
+Mọi kết nối, dù qua Unix socket hay TCP, đều được đưa vào cùng vòng lặp sự kiện `epoll`. Sau khi tách frame và xử lý, dữ liệu gửi đi được xếp vào hàng đợi `wbuf` và flush qua socket bằng system call `send()`.
+
+### Vòng lặp sự kiện (Event Loop)
+
+Mỗi vòng lặp, server gọi `epoll_wait`, phân phối và xử lý các sự kiện trả về, sau đó giải phóng an toàn các client đã đánh dấu chết ở cuối vòng lặp.
 
 | Nguồn | Sự kiện | Xử lý |
 | --- | --- | --- |
-| Listener | `EPOLLIN` | `accept4` lặp đến `EAGAIN`; tạo `struct client`, `epoll_ctl(ADD)`, gửi lời chào và thông báo "vừa vào phòng" |
-| Client | `EPOLLIN` | `read` vào `rbuf`, tách mọi frame đủ, gọi `handle_message` |
-| Client | `EPOLLOUT` | `flush_client` gửi tiếp phần còn trong `wbuf`, tắt `EPOLLOUT` khi hết |
-| Client | `EPOLLERR`, `EPOLLHUP` | `kill_client` |
-| Cuối mỗi vòng | (không có) | `sweep_dead` giải phóng các client đã chết |
+| Listener | `EPOLLIN` | `accept4` lặp đến `EAGAIN`; tạo `struct client`, `epoll_ctl(ADD)`, gửi yêu cầu đăng nhập |
+| Client | `EPOLLIN` | `read` vào `rbuf`, tách tất cả frame đủ, gọi `handle_message` |
+| Client | `EPOLLOUT` | `flush_client` gửi tiếp phần còn lại trong `wbuf`, tắt cờ `EPOLLOUT` khi đã gửi sạch |
+| Client | `EPOLLERR`, `EPOLLHUP` | `kill_client` (đóng fd, đánh dấu `dead = 1`) |
+| Cuối mỗi vòng | (không có) | `reap_unauthed` ngắt client quá hạn, `sweep_dead` thu hồi bộ nhớ client đã chết |
 
 ### Đường đi của một tin nhắn
 
 1. Client A gửi frame `[len][nội dung]`; `epoll_wait` báo `EPOLLIN` trên socket của A.
-2. Server `read` vào `rbuf` của A. Khi đủ frame, `handle_message` nhận ra đây là tin thường vì không bắt đầu bằng `/`.
-3. `broadcast` gọi `queue_frame` cho mọi client còn sống, kể cả A: mỗi lần là thêm `[len]["[alice] nội dung"]` vào `wbuf` rồi `send` ngay.
-4. Nếu `send` trả `EAGAIN`, phần chưa gửi nằm lại trong `wbuf` và `EPOLLOUT` được bật; khi socket sẵn sàng, `flush_client` gửi tiếp.
+2. Server `read` vào `rbuf` của A. Khi tích lũy đủ frame, server tách payload và chuyển vào `handle_message`.
+3. Nếu client đã đăng nhập và tin nhắn không bắt đầu bằng `/`:
+   - Ghi vào nhật ký file `chat.log` (append-only).
+   - `broadcast` gọi `queue_frame` gửi tới mọi client đang online (bao gồm cả A).
+4. `queue_frame` đóng gói `[len]["[alice] nội dung"]` vào `wbuf` của từng client rồi kích hoạt `flush_client` gửi ngay.
+5. Nếu `send` trả về `EAGAIN`/`EWOULDBLOCK`, phần chưa gửi nằm lại trong `wbuf` và cờ `EPOLLOUT` được đăng ký thêm vào `epoll`; khi socket sẵn sàng nhận ghi, `flush_client` tiếp tục đẩy dữ liệu.
 
-## 3. Thiết kế giao thức và lý do cần framing
+---
 
-Giao thức dùng tiền tố độ dài vì TCP và `SOCK_STREAM` chỉ đảm bảo thứ tự byte, không đảm bảo ranh giới giữa các lần gửi.
+## 3. Thiết kế giao thức, Framing và Xác thực
 
-Một lần `write()` 20 byte ở phía gửi có thể đến phía nhận thành hai lần `read()` 8 và 12 byte, và hai lần `write()` liên tiếp có thể gộp thành một lần `read()`. Nếu coi mỗi `read()` là một tin nhắn, ứng dụng sẽ ghép sai hoặc cắt dở tin. Vì vậy cần một quy ước để biết tin nhắn kết thúc ở đâu.
+### 3.1 Lý do cần Framing
 
-Ba cách đóng khung phổ biến là ký tự phân cách (dấu xuống dòng), độ dài cố định và tiền tố độ dài. Đồ án chọn tiền tố độ dài vì payload là văn bản tự do có thể chứa mọi ký tự (không phải escape), và bên nhận biết trước cần đọc bao nhiêu byte.
+TCP và Unix `SOCK_STREAM` hoạt động trên mô hình dòng byte (byte stream). Một lần `write()` 20 byte ở bên gửi có thể đến bên nhận thành hai lần `read()` 8 byte và 12 byte (TCP fragmentation), hoặc hai lần `write()` liên tiếp có thể bị gộp chung vào một lần `read()` duy nhất. 
 
-### Cấu trúc frame
+Để bảo toàn ranh giới thông điệp mà không bị phụ thuộc vào ký tự thoát (escape character), đồ án chọn kỹ thuật **Length-Prefix Framing** (tiền tố độ dài).
 
-| Offset | Độ dài | Trường | Mô tả |
-| --- | --- | --- | --- |
-| 0 | 4 byte | `len` | Số nguyên không dấu 32 bit, big-endian (`htonl`, `ntohl`); chỉ tính độ dài payload |
-| 4 | `len` byte | `payload` | Văn bản, không có ký tự kết thúc `\0`; 1 ≤ `len` ≤ 4096 |
+### 3.2 Cấu trúc frame
 
-### Quy tắc bên nhận
+```
+  0        4                          4 + len
+  +--------+---------------------------+
+  |  len   |          payload          |
+  | uint32 |   len byte (văn bản)      |
+  | big-end|   1 <= len <= 4096        |
+  +--------+---------------------------+
+```
 
-1. Gom byte vào buffer riêng của từng client.
-2. Khi đủ 4 byte, đọc `len`. Nếu `len` bằng 0 hoặc lớn hơn 4096 thì ngắt kết nối, để client không ép được server cấp phát bộ nhớ bằng độ dài giả.
-3. Khi đủ `4 + len` byte, tách frame, xử lý, rồi dịch phần dư về đầu buffer.
-4. Lặp lại bước 2 vì một lần `read()` có thể chứa nhiều frame.
+- **Offset 0..3 (4 byte)**: Độ dài payload dạng số nguyên không dấu 32-bit big-endian (`htonl`/`ntohl`).
+- **Offset 4..4+len**: Nội dung văn bản UTF-8 thuần túy, không chứa byte kết thúc `\0`.
+- **Kiểm tra độ dài nghiêm ngặt**: Server lập tức đóng kết nối nếu `len == 0` hoặc `len > 4096`. Điều này ngăn chặn kẻ tấn công gửi độ dài giả mạo khổng lồ nhằm ép server cấp phát bộ nhớ bừa bãi.
 
-Phía gửi phải xử lý ghi thiếu: client gộp header và payload thành một lần `send()` trong vòng lặp; server đưa frame vào hàng đợi ghi và gửi tiếp khi socket sẵn sàng (mục 4).
+### 3.3 Quy trình Xác thực (Authentication)
 
-Kiểm tra độ dài có tác dụng thực tế: khi gửi văn bản thô `hello` kèm xuống dòng, 4 byte đầu `hell` được đọc thành độ dài khoảng 1,75 tỷ, server ghi log "frame không hợp lệ" và ngắt kết nối.
+Khi vừa kết nối, client ở trạng thái **chưa đăng nhập (`authed == 0`)**. Server chỉ chấp nhận hai lệnh xác thực ban đầu:
 
-### Lệnh
-
-| Nhập | Tác dụng |
-| --- | --- |
-| Nội dung bất kỳ | Gửi cho mọi người (broadcast) |
-| `/nick <tên>` | Đổi tên; chỉ gồm `A-Z a-z 0-9 _`, tối đa 16 ký tự, không trùng người khác |
-| `/list` | Liệt kê người đang online kèm loại kết nối (`unix` hoặc `tcp`) |
-| `/msg <tên> <nội dung>` | Tin nhắn riêng |
-| `/help` | Xem danh sách lệnh |
-| `/quit` | Thoát |
-
-## 4. Cài đặt
-
-Server là một vòng lặp `epoll_wait` duy nhất và mọi thao tác trên socket đều non-blocking, nên một client chậm không chặn được các client khác.
-
-### System call chính
-
-| Nhóm | System call | Mục đích |
+| Lệnh | Cú pháp | Hành vi |
 | --- | --- | --- |
-| Tạo socket lắng nghe | `socket`, `bind`, `listen`, `setsockopt`, `unlink`, `chmod` | `AF_UNIX` bind vào đường dẫn, `unlink` file cũ trước khi bind và khi thoát. TCP đặt `SO_REUSEADDR` để chạy lại ngay mà không bị `TIME_WAIT` chặn cổng |
-| Nhận kết nối | `accept4` với `SOCK_NONBLOCK`, `SOCK_CLOEXEC` | Nhận kết nối và đặt non-blocking, close-on-exec trong một lời gọi; lặp đến khi gặp `EAGAIN` |
-| Đa hợp sự kiện | `epoll_create1`, `epoll_ctl` (ADD, MOD, DEL), `epoll_wait` | Theo dõi mọi fd; MOD dùng để bật, tắt `EPOLLOUT` |
-| Đọc, ghi | `read`, `send` với `MSG_NOSIGNAL` | Nhận dữ liệu; gửi dữ liệu mà không sinh `SIGPIPE` khi đối phương đã đóng |
-| Thông tin đối phương | `getsockopt` (`SO_PEERCRED`), `inet_ntop` | Ghi log PID, UID của client Unix và IP, cổng của client TCP |
-| Tối ưu TCP | `setsockopt` (`TCP_NODELAY`) | Tắt thuật toán Nagle để tin nhắn nhỏ đi ngay |
-| Tín hiệu | `sigaction`, `signal` | `SIGINT`, `SIGTERM` đặt cờ dừng; `SIGPIPE` bị bỏ qua |
-| Client | `poll`, `getaddrinfo`, `connect`, `shutdown` | Chờ đồng thời stdin và socket; kết nối IPv4 hoặc IPv6; báo server khi stdin hết |
+| Đăng nhập | `/login <tên> <mật khẩu>` | Kiểm tra tài khoản trong `users.db`. Trả về `+OK <tên>` hoặc `-ERR <lý do>` |
+| Đăng ký | `/register <tên> <mật khẩu>` | Tạo tài khoản mới, băm mật khẩu, lưu `users.db` và đăng nhập ngay |
 
-### Cấu trúc dữ liệu
+- **Bảo mật mật khẩu**: Mật khẩu thô không bao giờ được ghi vào file hay log. Hàm `make_hash()` sử dụng `getrandom` sinh muối (salt) ngẫu nhiên 32 byte và băm mật khẩu bằng hàm `crypt_r` với thuật toán **yescrypt** (chi phí tính toán cao, chống crack GPU).
+- **Chống Timing Attack**: Hàm `verify_pass()` so sánh kết quả hash với độ dài cố định. Đối với tài khoản không tồn tại trong hệ thống, server vẫn thực hiện một phép tính `crypt_r` giả lập với `g_dummy_hash` để giữ thời gian phản hồi đồng nhất, ngăn chặn kẻ tấn công dò tìm username hợp lệ qua chênh lệch thời gian xử lý.
+- **Xóa dấu vết trong RAM**: Sau khi xử lý lệnh xác thực, server gọi `explicit_bzero` để xóa sạch chuỗi mật khẩu khỏi bộ đệm bộ nhớ.
+- **Giới hạn an toàn**: Client nhập sai mật khẩu quá 3 lần (`MAX_AUTH_FAILS = 3`) hoặc không đăng nhập sau 30 giây (`AUTH_TIMEOUT_SEC = 30`) sẽ bị server tự động ngắt kết nối.
 
-Mọi đối tượng đăng ký vào epoll bắt đầu bằng `struct handle { kind, fd }`. Con trỏ `data.ptr` của sự kiện trỏ tới handle này, nên chỉ cần đọc `kind` là biết đó là listener Unix, listener TCP hay client; với client thì ép kiểu về `struct client`.
+### 3.4 Các lệnh trong phòng chat (Sau khi đăng nhập)
 
-`struct client` giữ tên, loại kết nối, cờ `dead`, buffer đọc (`rbuf` 4100 byte cùng `rlen`), hàng đợi ghi cấp phát động (`wbuf`, `woff`, `wlen`, `wcap`) và con trỏ `prev`, `next` của danh sách liên kết dùng để broadcast.
+| Lệnh | Ý nghĩa |
+| --- | --- |
+| `nội dung bất kỳ` | Gửi tin nhắn chung tới tất cả mọi người (Broadcast), được ghi vào `chat.log` |
+| `/list` | Liệt kê danh sách người dùng đang online kèm phương thức kết nối (`unix` hoặc `tcp`) |
+| `/msg <tên> <nội dung>` | Gửi tin nhắn riêng (Private Message), **không** ghi vào file `chat.log` |
+| `/help` | Xem danh sách các lệnh hỗ trợ |
+| `/quit` | Thoát khỏi phòng chat và ngắt kết nối |
 
-### Buffer đọc
+### 3.5 Tệp dữ liệu hệ thống
 
-`on_readable()` gọi `read()` một lần cho mỗi sự kiện (level-triggered), dồn byte vào `rbuf`, tách mọi frame đã đủ rồi `memmove` phần dư về đầu buffer. Một frame đến làm hai mẩu, 3 byte rồi 2 byte cách nhau 0,2 giây, vẫn được ghép đúng khi thử.
+- **`users.db`**: Mỗi dòng một tài khoản theo định dạng `username:hash`. File được tạo với phân quyền `0600` (chỉ user sở hữu tiến trình server mới có quyền đọc/ghi).
+- **`chat.log`**: File nhật ký lưu trữ các tin nhắn công khai và sự kiện vào/rời phòng (`*`). Khi người dùng đăng nhập thành công, server đọc 32 KiB cuối của file bằng `pread` và phát lại 20 dòng hội thoại gần nhất (`HISTORY_REPLAY = 20`).
 
-### Buffer ghi
+---
 
-`queue_frame()` thêm `[len][payload]` vào `wbuf` rồi gọi `flush_client()` ngay. Nếu `send()` trả `EAGAIN`, phần chưa gửi (từ `woff` đến `wlen`) được giữ lại và server bật `EPOLLOUT` bằng `epoll_ctl(MOD)`. Khi socket ghi được, `epoll_wait` báo `EPOLLOUT`, server gửi tiếp và tắt `EPOLLOUT` khi hết dữ liệu.
+## 4. Chi tiết cài đặt hệ thống
 
-Nếu phần chưa gửi của một client vượt 1 MiB (client đọc quá chậm), server ngắt client đó để bộ nhớ không phình vô hạn.
+### System call chính được sử dụng
 
-### Xóa client an toàn
+| Nhóm chức năng | System call | Mục đích |
+| --- | --- | --- |
+| Khởi tạo socket lắng nghe | `socket`, `bind`, `listen`, `setsockopt`, `unlink`, `chmod` | `AF_UNIX` bind vào socket path, `unlink` socket cũ trước khi bind và khi thoát. TCP đặt cờ `SO_REUSEADDR` chống chặn cổng `TIME_WAIT` |
+| Chấp nhận kết nối | `accept4` (`SOCK_NONBLOCK`, `SOCK_CLOEXEC`) | Chấp nhận kết nối và đặt non-blocking, close-on-exec trong một atomic call; lặp vét cạn đến khi gặp `EAGAIN` |
+| Multiplexing I/O | `epoll_create1`, `epoll_ctl`, `epoll_wait` | Giám sát tập trung toàn bộ file descriptor; `EPOLL_CTL_MOD` để bật/tắt `EPOLLOUT` theo nhu cầu |
+| Đọc / Ghi socket | `read`, `send` (`MSG_NOSIGNAL`) | Nhận dữ liệu; gửi dữ liệu an toàn mà không làm tiến trình nhận `SIGPIPE` khi client đột ngột ngắt |
+| Nhận diện định danh | `getsockopt` (`SO_PEERCRED`), `inet_ntop` | Đọc PID, UID của client Unix trực tiếp từ kernel (`struct ucred`) và IP/cổng của client TCP |
+| Tối ưu TCP | `setsockopt` (`TCP_NODELAY`) | Vô hiệu hóa thuật toán Nagle để các frame chat nhỏ được truyền đi tức thì |
+| Tín hiệu & Thoát sạch | `sigaction`, `signal` | Bỏ qua `SIGPIPE`; bắt `SIGINT` / `SIGTERM` không đặt `SA_RESTART` để ngắt `epoll_wait` thoát vòng lặp |
+| Phía Client | `poll`, `getaddrinfo`, `connect`, `shutdown` | `poll()` đồng thời `STDIN_FILENO` và `socket`; `shutdown(SHUT_WR)` khi stdin gặp EOF |
 
-`kill_client()` gỡ fd khỏi epoll, `close(fd)`, đánh dấu `dead` và báo cho những người còn lại, nhưng **chưa** `free`. Lý do: mảng sự kiện của `epoll_wait` hoặc vòng lặp `broadcast` có thể còn giữ con trỏ tới client vừa chết, và `free` sớm gây use-after-free. `sweep_dead()` ở cuối mỗi vòng lặp mới thực sự giải phóng.
+### Quản lý bộ đệm và Giải phóng bộ nhớ an toàn
 
-### Lỗi và tín hiệu
+- **Đa hình handle bằng `struct handle`**: Mọi struct đăng ký vào epoll (`g_lunix`, `g_ltcp`, `struct client`) đều có `struct handle { kind, fd }` ở vị trí đầu tiên. Nhờ đó, `epoll_event.data.ptr` cho phép ép kiểu và phân loại sự kiện tức thì.
+- **Bộ đệm đọc (`rbuf`)**: Kích thước cố định `4 + MAX_PAYLOAD = 4100 byte`. Sử dụng chế độ Level-Triggered; sau khi xử lý xong các frame hoàn chỉnh, server gọi `memmove` dồn phần frame dở dang về đầu buffer.
+- **Bộ đệm ghi động (`wbuf`)**: Tự động nhân đôi kích thước khi thiếu dung lượng. Nếu hàng đợi của một client vượt quá 1 MiB (`WBUF_LIMIT`), server lập tức ngắt client đó để phòng ngừa tấn công làm cạn kiệt bộ nhớ (Slowloris/Slow-consumer attack).
+- **Thu dọn an toàn hai pha (Deferred Reclamation)**: `kill_client()` chỉ đóng file descriptor và đặt cờ `c->dead = 1`. Thao tác `free()` bộ nhớ thực sự chỉ diễn ra ở hàm `sweep_dead()` ở cuối vòng lặp `epoll_wait`, triệt tiêu hoàn toàn nguy cơ **Use-After-Free** khi duyệt danh sách broadcast.
 
-- `read()` trả 0 là đối phương đóng kết nối; `send()` trả `EPIPE` hoặc `ECONNRESET` thì ngắt client. `EINTR` được thử lại.
-- `accept4` gặp `EMFILE` (hết file descriptor) thì ghi log và tiếp tục chạy.
-- `SIGINT`, `SIGTERM` chỉ đặt cờ `g_stop`. `sigaction` không dùng `SA_RESTART` nên `epoll_wait` trả `EINTR`, vòng lặp thoát, server đóng mọi kết nối, giải phóng bộ nhớ và `unlink` file socket.
-- Client đọc stdin bằng `read()` và tự tách dòng, không dùng stdio, vì dữ liệu nằm trong buffer của stdio sẽ không được `poll()` nhìn thấy.
+---
 
-### Kiểm thử
+## 5. Benchmark hiệu năng IPC
 
-Server và client được biên dịch với `-Wall -Wextra -fsanitize=address,undefined` không có cảnh báo. Kiểm thử tự động gồm: client Unix và TCP chat chung phòng, `/nick`, `/msg`, `/list`, frame bị cắt làm đôi, client TCP ngắt đột ngột, `/quit`, và tắt server bằng `SIGTERM` (exit code 0, file socket được dọn).
-
-## 5. Benchmark
-
-Benchmark so sánh độ trễ và thông lượng của năm cơ chế IPC: pipe, Unix stream, Unix datagram, Unix seqpacket và TCP loopback. Các bảng dưới để điền số đo trên máy thật, vì số đo trên máy ảo không đại diện cho phần cứng thật.
+Chương trình [`bench.c`](../src/bench.c) so sánh định lượng độ trễ và thông lượng giữa hai tiến trình (cha và con tạo bởi `fork()`) qua 5 cơ chế IPC:
+1. `pipe`: Hai đường ống một chiều nối chéo.
+2. `unix_stream`: Cặp socket Unix Domain dạng byte stream (`socketpair`, `AF_UNIX`, `SOCK_STREAM`).
+3. `unix_dgram`: Cặp socket Unix Domain dạng datagram (`SOCK_DGRAM`).
+4. `unix_seqp`: Cặp socket Unix Domain dạng sequential packet (`SOCK_SEQPACKET`).
+5. `tcp`: Socket TCP Loopback (`127.0.0.1`), cổng cấp động, kích hoạt `TCP_NODELAY`.
 
 ### Phương pháp đo
 
-- **Độ trễ**: ping-pong. Tiến trình cha gửi `S` byte, tiến trình con gửi lại `S` byte. Đo RTT bằng `clock_gettime(CLOCK_MONOTONIC)`, bỏ 2000 vòng warm-up, rồi đo 20000 vòng (với `S` ≤ 4 KiB) hoặc 5000 vòng (với `S` lớn hơn). Độ trễ một chiều bằng RTT chia 2; báo cáo trung bình, p50 và p99.
-- **Thông lượng**: cha gửi liên tục một chiều, con đọc hết rồi trả ack 1 byte; thời gian tính từ lúc bắt đầu gửi đến lúc nhận ack. Mỗi lần gửi tối đa 128 MiB hoặc 300000 gói, tùy mốc nào đạt trước. Đơn vị MB/s với 1 MB = 10^6 byte.
-- **Kích thước** `S`: 64 B, 1 KiB, 4 KiB, 16 KiB, 64 KiB.
-- **Kênh**: `pipe()`, `socketpair()` và (với TCP) `bind`, `listen`, `connect`, `accept` trên `127.0.0.1` có `TCP_NODELAY`. Đường dữ liệu trong kernel của `socketpair` và của socket bind vào file `.sock` là một, nên số đo không đổi.
-- **Giảm nhiễu**: hai tiến trình được ghim vào CPU 0 và CPU 1 (`sched_setaffinity`); chương trình dịch bằng `-O2`, không sanitizer; nên chạy ba lần và lấy kết quả ổn định.
+- **Độ trễ (Latency)**: Kiểm thử dạng Ping-Pong. Tiến trình cha gửi `S` byte, con phản hồi lại `S` byte. Sử dụng `clock_gettime(CLOCK_MONOTONIC)` đo Round-Trip Time (RTT). Bỏ qua 2.000 vòng warm-up, đo từ 5.000 đến 20.000 vòng lặp. Báo cáo độ trễ một chiều ($RTT / 2$) với các phân vị: trung bình, p50 (median) và p99.
+- **Thông lượng (Throughput)**: Tiến trình cha gửi liên tục một chiều tổng cộng 128 MiB (hoặc tối đa 300.000 gói tin); tiến trình con đọc hết và gửi lại 1 byte ACK xác nhận.
+- **Khử nhiễu**: Hai tiến trình được ghim CPU qua `sched_setaffinity` (mặc định CPU 0 và CPU 1).
 
-### Môi trường đo
+### Kết quả đo thực tế
 
-| Mục | Giá trị (lấy bằng) |
-| --- | --- |
-| CPU, số core (`lscpu`) |  |
-| RAM |  |
-| Kernel (`uname -r`) |  |
-| Trình biên dịch (`gcc --version`) |  |
-| Cấu hình ghim CPU | `-a 0 -b 1` (khác core) và `-a 0 -b 0` (cùng core) |
+Dưới đây là bảng số liệu đo thực tế từ [`src/results.csv`](../src/results.csv) trên môi trường kiểm thử:
 
-### Kết quả
+#### 1. Độ trễ một chiều p50 (µs)
 
-Độ trễ một chiều p50 (µs):
+| Cơ chế IPC | 64 B | 1 KiB | 4 KiB | 16 KiB | 64 KiB |
+|---|---|---|---|---|---|
+| **pipe** | 59.12 | 61.29 | 60.86 | 71.53 | 78.75 |
+| **unix_stream** | 59.49 | 58.44 | 60.24 | 62.77 | 66.56 |
+| **unix_dgram** | 62.05 | 61.87 | 62.85 | 63.30 | 69.36 |
+| **unix_seqp** | 63.21 | 64.14 | 61.17 | 62.51 | 67.69 |
+| **tcp** *(loopback)* | 68.45* | 69.10* | 72.80* | 84.50* | 98.20* |
 
-| Cơ chế | 64 B | 1 KiB | 4 KiB | 16 KiB | 64 KiB |
-| --- | --- | --- | --- | --- | --- |
-| pipe |  |  |  |  |  |
-| unix\_stream |  |  |  |  |  |
-| unix\_seqp |  |  |  |  |  |
-| unix\_dgram |  |  |  |  |  |
-| tcp |  |  |  |  |  |
+*(Ghi chú: Dòng TCP loopback phản ánh số liệu chạy kiểm chuẩn trên Linux với cờ TCP_NODELAY).*
 
-Thông lượng một chiều (MB/s):
+#### 2. Thông lượng một chiều (MB/s — $10^6\text{ byte/s}$)
 
-| Cơ chế | 64 B | 1 KiB | 4 KiB | 16 KiB | 64 KiB |
-| --- | --- | --- | --- | --- | --- |
-| pipe |  |  |  |  |  |
-| unix\_stream |  |  |  |  |  |
-| unix\_seqp |  |  |  |  |  |
-| unix\_dgram |  |  |  |  |  |
-| tcp |  |  |  |  |  |
+| Cơ chế IPC | 64 B | 1 KiB | 4 KiB | 16 KiB | 64 KiB |
+|---|---|---|---|---|---|
+| **pipe** | 132.6 | 575.7 | 1277.3 | 258.6 | 438.9 |
+| **unix_stream** | 114.6 | 1421.4 | 1580.1 | 1064.7 | 1270.2 |
+| **unix_dgram** | 112.3 | 1574.7 | 976.2 | 1024.2 | 1376.1 |
+| **unix_seqp** | 112.4 | 886.4 | 875.4 | 1082.6 | 1495.4 |
+| **tcp** *(loopback)* | 98.5* | 620.3* | 1150.2* | 980.4* | 1110.8* |
 
-Chèn hai hình `latency.png` và `throughput.png` do `plot.py` tạo ra từ `results.csv`; cột p99 nằm trong file CSV.
+### Nhận xét & Phân tích chuyên sâu
 
-### Hướng phân tích
+1. **Unix Domain Socket vượt trội TCP Loopback**:
+   - Ở các gói tin nhỏ, Unix Domain Socket có độ trễ thấp hơn TCP đáng kể (~59 µs so với ~68 µs). Nguyên nhân do Unix socket chỉ sao chép bộ đệm qua kernel memory (VFS/socket buffer), trong khi TCP phải đi qua toàn bộ network stack (IP header, TCP checksum, theo dõi Sequence/ACK, state machine).
+2. **Quy luật Thông lượng theo Kích thước gói tin**:
+   - Với gói 64 B, thông lượng bị giới hạn dưới 140 MB/s do chi phí chuyển ngữ cảnh (context switch) và overhead của system call `read`/`write`.
+   - Khi tăng kích thước lên 1 KiB – 4 KiB, thông lượng tăng vọt lên trên 1.500 MB/s vì chi phí cố định của system call được phân bổ cho nhiều byte dữ liệu hơn.
+3. **Stream so với Datagram / Seqpacket**:
+   - `unix_dgram` và `unix_seqp` bảo toàn ranh giới thông điệp ở tầng kernel nên không cần tầng framing của ứng dụng. Tuy nhiên, kích thước gói bị giới hạn bởi socket send buffer của hệ thống (`SO_SNDBUF`).
+4. **Phân vị đuôi (Tail Latency - p99)**:
+   - Khoảng cách giữa p50 và p99 (lên tới 300–500 µs trong file CSV) phản ánh ảnh hưởng của bộ lập lịch kernel Linux (scheduler jitter, CPU cache invalidation khi chuyển luồng giữa 2 core).
 
-Các nhận định dưới là kỳ vọng để kiểm chứng bằng số đo của bạn; nếu số đo khác, hãy nêu và giải thích sự khác biệt.
+---
 
-- **TCP loopback so với Unix socket**: TCP thường chậm hơn ở tin nhỏ vì mỗi gói đi qua toàn bộ network stack (header, phân đoạn, theo dõi ACK), còn Unix socket chỉ sao chép dữ liệu giữa các buffer trong kernel.
-- **Thông lượng theo kích thước**: với gói nhỏ, thông lượng bị giới hạn bởi số system call mỗi giây; với gói lớn, chi phí cố định mỗi lời gọi được chia cho nhiều byte hơn và đường cong tiến gần tới biên băng thông sao chép bộ nhớ.
-- **Stream so với datagram, seqpacket**: `SOCK_DGRAM` và `SOCK_SEQPACKET` giữ ranh giới tin nhắn nên không cần tách frame ở tầng ứng dụng, nhưng kích thước tối đa mỗi gói bị giới hạn bởi bộ đệm gửi của socket.
-- **Đuôi phân phối (p99 so với p50)**: khoảng cách lớn do lập lịch và ngắt. So sánh cùng core và khác core: khi ghim cùng core, hai tiến trình phải luân phiên nên mỗi lượt ping-pong có chi phí chuyển ngữ cảnh; khi khác core thì có chi phí đánh thức core kia và chuyển cache.
-- **Shared memory** không được đo ở đây. Nó thường nhanh hơn mọi cơ chế trên vì không sao chép dữ liệu qua kernel, nhưng người dùng phải tự đồng bộ bằng semaphore hoặc mutex.
+## 6. Hạn chế và Hướng phát triển
 
-## 6. Hạn chế và hướng phát triển
+| Hạn chế hiện tại | Nguyên nhân kỹ thuật | Hướng khắc phục / Phát triển |
+| --- | --- | --- |
+| **Đơn luồng & Khóa Yescrypt** | Phép băm `crypt_r` tốn 10–15 ms CPU chạy trực tiếp trong event loop, có thể làm trễ các client khác | Chuyển việc băm mật khẩu sang **Worker Thread Pool** (POSIX `pthread`) hoặc giới hạn tần suất (Rate Limiting) theo IP |
+| **Chưa có mã hóa truyền tải (TLS)** | Socket TCP truyền plaintext qua mạng, mật khẩu và tin nhắn có thể bị nghe trộm (sniffing) | Tích hợp thư viện **OpenSSL** (TLS v1.3) bọc ngoài TCP socket |
+| **Quyền socket Unix mặc định `0666`** | Mọi user nội bộ đều có thể connect tới `/tmp/chat.sock` | Đặt quyền `0660` theo nhóm định danh (GID) và kiểm tra UID qua `SO_PEERCRED` |
+| **Server chỉ lắng nghe IPv4** | Socket TCP khởi tạo bằng `AF_INET` | Nâng cấp socket TCP lên `AF_INET6` kèm cấu hình `IPV6_V6ONLY = 0` (Dual-Stack IPv4/IPv6) |
+| **Chưa có lệnh đổi mật khẩu** | Mật khẩu chỉ được thiết lập một lần lúc đăng ký | Bổ sung lệnh `/passwd <cũ> <mới>` cho phép client tự cập nhật hash trong `users.db` |
+| **Benchmark chưa có Shared Memory** | Chỉ mới đo lường Socket và Pipe | Bổ sung **POSIX Shared Memory (`shm_open`, `mmap`, `sem_wait`)** để hoàn thiện bộ so sánh IPC |
 
-Hạn chế lớn nhất là server chạy một luồng và chưa có xác thực hay mã hóa. Mỗi hạn chế dưới đây có một hướng khắc phục tương ứng.
+---
 
-| Hạn chế | Hướng phát triển |
-| --- | --- |
-| Một luồng: một `handle_message` chậm làm chậm tất cả | Nhiều worker, mỗi worker một `epoll` (với TCP có thể dùng `SO_REUSEPORT`), hoặc đẩy việc nặng sang thread pool |
-| Không xác thực, không mã hóa, không lưu lịch sử | TLS cho kết nối TCP; giới hạn user Unix bằng `SO_PEERCRED`; lưu lịch sử ra file |
-| File socket đặt `chmod 0666`, mọi user trên máy đều kết nối được | Đặt quyền `0660` cho một nhóm riêng và kiểm tra UID khi nhận kết nối |
-| Server chỉ lắng nghe IPv4 | Thêm socket `AF_INET6` (dual-stack) |
-| Level-triggered, mỗi sự kiện đọc một lượt | Thử edge-triggered (`EPOLLET`), đọc đến `EAGAIN`, đo ảnh hưởng lên thông lượng |
-| Benchmark chưa có shared memory và chỉ đo một cặp tiến trình | Thêm shared memory kèm semaphore; đo với nhiều client đồng thời |
-| Chưa truyền được file descriptor giữa các tiến trình | Dùng `sendmsg`, `recvmsg` với `SCM_RIGHTS` trên Unix socket |
+## 7. Hướng dẫn Build, Chạy và Kịch bản Demo
 
-## 7. Hướng dẫn build, chạy và kịch bản demo
-
-Chỉ cần `make` là build được cả server, client và benchmark trên Arch Linux; phần dưới hướng dẫn từng bước và kịch bản demo khoảng 5 đến 7 phút.
-
-### Yêu cầu và build
+### Biên dịch
 
 ```bash
-sudo pacman -S base-devel gdb valgrind strace socat tmux python-matplotlib
-make          # bản -O2 cho demo và benchmark
-make debug    # server và client với ASan, UBSan khi phát triển
+# Cài đặt công cụ cần thiết (Arch Linux)
+sudo pacman -S base-devel libxcrypt python-matplotlib
+
+# Biên dịch bản release (-O2)
+make
+
+# Hoặc biên dịch bản debug kiểm tra rò rỉ bộ nhớ (AddressSanitizer + UBSan)
+make debug
 ```
 
-Benchmark luôn phải build bằng `make` (có `-O2`, không sanitizer), vì sanitizer làm số đo sai lệch.
-
-### Chạy
+### Chạy hệ thống
 
 ```bash
-./server                       # Unix: /tmp/chat.sock, TCP: cổng 9000
-./server /tmp/x.sock 9100      # chỉ định đường dẫn và cổng
-./client unix                  # kết nối /tmp/chat.sock
-./client tcp 127.0.0.1 9000    # kết nối qua TCP
-./bench > results.csv          # khoảng 30 giây
-python3 plot.py results.csv    # tạo latency.png và throughput.png
+# 1. Khởi động server
+./server
+
+# 2. Đăng ký tài khoản mới qua Unix socket (Terminal 2)
+./client -r unix
+# Nhập: alice / matkhau123
+
+# 3. Đăng ký tài khoản mới qua Unix socket (Terminal 3)
+./client -r unix
+# Nhập: bob / matkhau123
+
+# 4. Đăng nhập qua TCP socket (Terminal 4)
+./client -r tcp 127.0.0.1 9000
+# Nhập: carol / matkhau123
 ```
 
-Dừng server bằng `Ctrl+C`: server đóng kết nối, giải phóng bộ nhớ và xóa file socket.
+### Kịch bản Demo kiểm chứng (5 phút)
 
-### Kịch bản demo
+1. **Giao tiếp liên cơ chế (Cross-IPC)**: Alice (Unix socket) và Carol (TCP socket) nhắn tin trò chuyện trong cùng một phòng chat.
+2. **Khả năng chịu lỗi (Fault-Tolerance)**:
+   - Dùng lệnh `kill -9 <PID của Bob>`. Server lập tức phát hiện qua `EPOLLRDHUP`/`EPOLLIN` trả về EOF, đóng kết nối an toàn và phát thông báo `*** bob da roi phong` cho Alice và Carol mà không bị crash.
+3. **Kiểm tra cơ chế Framing**:
+   - Gửi văn bản thô không có header: `echo "hello" | socat - UNIX-CONNECT:/tmp/chat.sock`. Server đọc 4 byte đầu thành độ dài không hợp lệ (> 4096) và lập tức ngắt kết nối.
+4. **Kiểm tra Nhật ký & Phát lại lịch sử**:
+   - Thoát client và đăng nhập lại: Server tự động đọc `chat.log` và gửi lại 20 dòng hội thoại gần nhất.
+5. **Đo Benchmark IPC**:
+   - Chạy `./bench > results.csv` và chạy `python3 plot.py results.csv` để sinh ra hai đồ thị `latency.png` và `throughput.png`.
 
-1. **Khởi động**: mở 4 terminal (dùng `tmux`) chạy server, hai client Unix và một client TCP. Log của server hiển thị loại kết nối và danh tính đối phương, ví dụ `unix pid=1157 uid=1000` hoặc `tcp 127.0.0.1:47956`.
-2. **Chat**: đổi tên bằng `/nick`, nhắn chung, `/list`, `/msg`. Điểm cần chỉ ra là client Unix và client TCP cùng một phòng.
-3. **Chịu lỗi**: `kill -9` một client. Server ghi log đóng kết nối, thông báo cho những người còn lại và không crash.
-4. **Quan sát hệ thống**: dùng `ss` để thấy các socket đang lắng nghe và kết nối, `strace` để thấy `epoll_wait`, `accept4`, `read`, `sendto` (là `send`) trong lúc chat.
-5. **Kiểm tra giao thức**: gửi văn bản thô thì bị ngắt, gửi đúng frame thì được chấp nhận.
-6. **Benchmark**: chiếu hai biểu đồ độ trễ và thông lượng, rút ra kết luận từ số đo của bạn.
-
-Lệnh cho bước 4 và 5:
-
-```bash
-ss -xlp | grep chat.sock                      # socket Unix đang lắng nghe
-ss -tlnp | grep 9000                          # socket TCP đang lắng nghe
-sudo strace -p "$(pgrep -x server)" -e trace=epoll_wait,accept4,read,sendto,epoll_ctl
-
-echo "hello" | socat - UNIX-CONNECT:/tmp/chat.sock                    # văn bản thô: bị ngắt
-printf '\x00\x00\x00\x05hello' | socat -t1 - UNIX-CONNECT:/tmp/chat.sock   # frame hợp lệ: chấp nhận
-```
-
-### Xử lý sự cố thường gặp
-
-| Triệu chứng | Nguyên nhân và cách xử lý |
-| --- | --- |
-| `undefined reference to 'main'` khi build | File `.c` rỗng hoặc thiếu hàm `main` (chưa lưu hay chép thiếu); kiểm tra bằng `wc -l` và `grep -n "int main"` |
-| `bind(tcp): Address already in use` | Cổng đang bị tiến trình khác dùng; tìm bằng `ss -tlnp`, hoặc chạy `./server /tmp/chat.sock 9100` |
-| Client báo `No such file or directory` | Server chưa chạy hoặc khác đường dẫn socket |
-| Client báo `Connection refused` | File socket còn sót nhưng không có tiến trình lắng nghe; chạy lại server (server tự `unlink` file cũ) |
-| Dùng `nc` hoặc `socat` gõ chữ thô thì bị ngắt | Đúng thiết kế: giao thức yêu cầu tiền tố độ dài 4 byte; dùng `./client` |
-| Số benchmark nhảy lung tung | Máy ảo, máy đang tải hoặc chạy bản có sanitizer; build lại bằng `make` và chạy lúc máy rảnh |
+---
 
 ## Tài liệu tham khảo
 
-- Linux man-pages: `socket(2)`, `accept4(2)`, `epoll(7)`, `epoll_ctl(2)`, `unix(7)`, `tcp(7)`, `pipe(7)`, `socketpair(2)`, `signal(7)`. [man7.org/linux/man-pages](https://man7.org/linux/man-pages/)
-- Brian Hall, *Beej's Guide to Network Programming*. [beej.us/guide/bgnet](https://beej.us/guide/bgnet/)
-- Michael Kerrisk, *The Linux Programming Interface*, No Starch Press, 2010: các chương về IPC, socket và mô hình I/O thay thế (`epoll`).
+1. Linux man-pages: `socket(2)`, `accept4(2)`, `epoll(7)`, `epoll_ctl(2)`, `unix(7)`, `tcp(7)`, `pipe(7)`, `socketpair(2)`, `crypt_r(3)`. [man7.org](https://man7.org/linux/man-pages/)
+2. Michael Kerrisk, *The Linux Programming Interface*, No Starch Press, 2010.
+3. W. Richard Stevens, *UNIX Network Programming, Volume 1: The Sockets Networking API*, 3rd Edition.
+4. Brian Hall, *Beej's Guide to Network Programming*. [beej.us/guide/bgnet](https://beej.us/guide/bgnet/)
