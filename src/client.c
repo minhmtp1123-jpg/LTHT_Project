@@ -2,15 +2,18 @@
  * client.c - Client cho chat server (Unix domain socket hoac TCP)
  *            Dang nhap bang username + mat khau, sau do dung poll() cho
  *            stdin va socket cung luc.
+ *            Ho tro ANSI line management chong de dong chat khi dang go.
  *
- * Giao thuc: [4 byte do dai, big-endian][payload]  (giong server.c)
+ * Giao thuc: [4 byte do dai, big-endian][payload] (dung chung qua proto.h)
  *
- * Build:  gcc -Wall -Wextra -O2 -g -o client client.c
+ * Build:  gcc -Wall -Wextra -O2 -g -o client client.c proto.c
  * Chay:   ./client [-r] unix [duong_dan]     mac dinh /tmp/chat.sock
  *         ./client [-r] tcp  [host] [port]   mac dinh 127.0.0.1 9000
  *         -r : dang ky tai khoan moi (hoi mat khau 2 lan) thay vi dang nhap
  */
 #define _GNU_SOURCE
+#include "proto.h"
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
@@ -26,8 +29,9 @@
 #include <termios.h>
 #include <unistd.h>
 
-#define MAX_PAYLOAD 4096
-#define RBUF_SIZE   (4 + MAX_PAYLOAD)
+static int g_is_tty = 0;
+static char g_input_buf[MAX_PAYLOAD];
+static size_t g_input_len = 0;
 
 static void die(const char *what)
 {
@@ -85,34 +89,6 @@ static int connect_tcp(const char *host, const char *port)
     return fd;
 }
 
-/* ---------- gui frame (blocking, xu ly short write) ---------- */
-
-static int write_full(int fd, const void *buf, size_t n)
-{
-    size_t sent = 0;
-    while (sent < n) {
-        ssize_t w = send(fd, (const char *)buf + sent, n - sent, MSG_NOSIGNAL);
-        if (w < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        sent += (size_t)w;
-    }
-    return 0;
-}
-
-static int send_msg(int fd, const char *data, size_t len)
-{
-    if (len == 0 || len > MAX_PAYLOAD)
-        return 0;
-    uint8_t buf[RBUF_SIZE];
-    uint32_t nlen = htonl((uint32_t)len);
-    memcpy(buf, &nlen, 4);
-    memcpy(buf + 4, data, len);          /* gop 1 lan send de tranh 2 goi nho */
-    return write_full(fd, buf, 4 + len);
-}
-
 /* ---------- nhan frame: gom byte -> tach frame ---------- */
 
 /* Tra 0 = ok, -1 = server dong / loi / frame sai */
@@ -130,20 +106,33 @@ static int on_socket_readable(int fd, uint8_t *rbuf, size_t *rlen)
     *rlen += (size_t)n;
 
     size_t off = 0;
-    while (*rlen - off >= 4) {
+    while (*rlen - off >= HEADER_SIZE) {
         uint32_t len;
-        memcpy(&len, rbuf + off, 4);
+        memcpy(&len, rbuf + off, HEADER_SIZE);
         len = ntohl(len);
         if (len == 0 || len > MAX_PAYLOAD) {
             fprintf(stderr, "[client] frame sai tu server (len=%u)\n", len);
             return -1;
         }
-        if (*rlen - off < 4 + (size_t)len)
+        if (*rlen - off < HEADER_SIZE + (size_t)len)
             break;
-        fwrite(rbuf + off + 4, 1, len, stdout);
-        fputc('\n', stdout);
-        fflush(stdout);
-        off += 4 + (size_t)len;
+
+        /* In thong diep, ho tro ANSI line management de khong de len chu dang go */
+        if (g_is_tty) {
+            fputs("\r\033[K", stdout);
+            fwrite(rbuf + off + HEADER_SIZE, 1, len, stdout);
+            fputc('\n', stdout);
+            fputs("> ", stdout);
+            if (g_input_len > 0)
+                fwrite(g_input_buf, 1, g_input_len, stdout);
+            fflush(stdout);
+        } else {
+            fwrite(rbuf + off + HEADER_SIZE, 1, len, stdout);
+            fputc('\n', stdout);
+            fflush(stdout);
+        }
+
+        off += HEADER_SIZE + (size_t)len;
     }
     if (off) {
         memmove(rbuf, rbuf + off, *rlen - off);
@@ -155,42 +144,50 @@ static int on_socket_readable(int fd, uint8_t *rbuf, size_t *rlen)
 /* ---------- doc stdin theo dong (khong dung stdio de tron voi poll) ---------- */
 
 /* Tra 0 = ok, 1 = stdin EOF, -1 = loi gui */
-static int on_stdin_readable(int sock, char *lbuf, size_t *llen)
+static int on_stdin_readable(int sock)
 {
     ssize_t n;
     do {
-        n = read(STDIN_FILENO, lbuf + *llen, MAX_PAYLOAD - *llen);
+        n = read(STDIN_FILENO, g_input_buf + g_input_len, MAX_PAYLOAD - g_input_len);
     } while (n < 0 && errno == EINTR);
 
     if (n < 0)
         return (errno == EAGAIN) ? 0 : -1;
-    if (n == 0) {                        /* EOF: gui not phan con lai (neu co) */
-        if (*llen > 0 && send_msg(sock, lbuf, *llen) < 0)
+    if (n == 0) {
+        if (g_input_len > 0 && send_frame_blocking(sock, g_input_buf, g_input_len) < 0)
             return -1;
-        *llen = 0;
+        g_input_len = 0;
         return 1;
     }
-    *llen += (size_t)n;
+    g_input_len += (size_t)n;
 
     size_t start = 0;
-    for (size_t i = 0; i < *llen; i++) {
-        if (lbuf[i] == '\n') {
+    for (size_t i = 0; i < g_input_len; i++) {
+        if (g_input_buf[i] == '\n') {
             size_t len = i - start;
-            if (len > 0 && lbuf[start + len - 1] == '\r')
+            if (len > 0 && g_input_buf[start + len - 1] == '\r')
                 len--;
-            if (send_msg(sock, lbuf + start, len) < 0)
+            if (send_frame_blocking(sock, g_input_buf + start, len) < 0)
                 return -1;
             start = i + 1;
+            if (g_is_tty) {
+                fputs("> ", stdout);
+                fflush(stdout);
+            }
         }
     }
     if (start) {
-        memmove(lbuf, lbuf + start, *llen - start);
-        *llen -= start;
+        memmove(g_input_buf, g_input_buf + start, g_input_len - start);
+        g_input_len -= start;
     }
-    if (*llen == MAX_PAYLOAD) {          /* dong qua dai: gui luon, khong cho \n */
-        if (send_msg(sock, lbuf, *llen) < 0)
+    if (g_input_len == MAX_PAYLOAD) {
+        if (send_frame_blocking(sock, g_input_buf, g_input_len) < 0)
             return -1;
-        *llen = 0;
+        g_input_len = 0;
+        if (g_is_tty) {
+            fputs("> ", stdout);
+            fflush(stdout);
+        }
     }
     return 0;
 }
@@ -208,15 +205,12 @@ static void restore_tty(void)
     }
 }
 
-/* Ctrl+C luc dang go mat khau: tra lai echo cho terminal roi thoat */
 static void on_sigint(int sig)
 {
     restore_tty();
     _exit(128 + sig);
 }
 
-/* Doc 1 dong tu stdin bang read() tung byte (khong dung stdio de khong
- * "an" mat du lieu cua cac dong sau). Tra: do dai, -1 neu EOF, -2 neu qua dai. */
 static int read_line(char *buf, size_t cap)
 {
     size_t n = 0;
@@ -248,7 +242,6 @@ static int read_line(char *buf, size_t cap)
     return too_long ? -2 : (int)n;
 }
 
-/* Hoi thong tin; secret != 0 thi tat echo neu stdin la terminal */
 static int prompt_line(const char *label, char *buf, size_t cap, int secret)
 {
     fprintf(stderr, "%s", label);
@@ -279,8 +272,6 @@ static int prompt_line(const char *label, char *buf, size_t cap, int secret)
     return r;
 }
 
-/* Tao chuoi lenh "/login <ten> <mat khau>" hoac "/register ...".
- * Tra 0 neu ok, -1 neu stdin het (EOF). */
 static int ask_credentials(int reg, char *out, size_t outsz)
 {
     char user[64], pass[128], pass2[128];
@@ -322,39 +313,6 @@ static int ask_credentials(int reg, char *out, size_t outsz)
     return 0;
 }
 
-static int read_exact(int fd, void *buf, size_t n)
-{
-    size_t got = 0;
-    while (got < n) {
-        ssize_t r = read(fd, (char *)buf + got, n - got);
-        if (r == 0)
-            return -1;
-        if (r < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        got += (size_t)r;
-    }
-    return 0;
-}
-
-/* Doc dung 1 frame (blocking), tra do dai payload hoac -1 */
-static int read_frame(int fd, char *buf, size_t cap)
-{
-    uint32_t len;
-    if (read_exact(fd, &len, 4) < 0)
-        return -1;
-    len = ntohl(len);
-    if (len == 0 || len >= cap)
-        return -1;
-    if (read_exact(fd, buf, len) < 0)
-        return -1;
-    buf[len] = '\0';
-    return (int)len;
-}
-
-/* Cho toi 300 ms xem server da dong ket noi chua */
 static int server_closed(int fd)
 {
     struct pollfd p = { .fd = fd, .events = POLLIN };
@@ -364,8 +322,6 @@ static int server_closed(int fd)
     return 0;
 }
 
-/* Gui /login hoac /register, cho "+OK" hoac "-ERR <ly do>".
- * Neu bi tu choi thi cho nhap lai (server ngat sau vai lan sai). */
 static int authenticate(int fd, int reg)
 {
     char reply[MAX_PAYLOAD + 1];
@@ -374,15 +330,15 @@ static int authenticate(int fd, int reg)
         char cmd[256];
         if (ask_credentials(reg, cmd, sizeof cmd) < 0)
             return -1;
-        int s = send_msg(fd, cmd, strlen(cmd));
+        int s = send_frame_blocking(fd, cmd, strlen(cmd));
         explicit_bzero(cmd, sizeof cmd);
         if (s < 0) {
             fprintf(stderr, "[client] loi gui: %s\n", strerror(errno));
             return -1;
         }
 
-        for (;;) {                       /* bo qua cac frame khong phai +OK/-ERR */
-            if (read_frame(fd, reply, sizeof reply) < 0) {
+        for (;;) {
+            if (read_frame_blocking(fd, reply, sizeof reply) < 0) {
                 fprintf(stderr, "[client] server da dong ket noi\n");
                 return -1;
             }
@@ -409,7 +365,7 @@ int main(int argc, char **argv)
 {
     int fd;
     int reg = 0;
-    int ai = 1;                          /* chi so cua "unix" / "tcp" */
+    int ai = 1;
 
     if (argc > 1 && strcmp(argv[1], "-r") == 0) {
         reg = 1;
@@ -433,10 +389,14 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    g_is_tty = isatty(STDIN_FILENO) && isatty(STDOUT_FILENO);
+    if (g_is_tty) {
+        fputs("> ", stdout);
+        fflush(stdout);
+    }
+
     uint8_t rbuf[RBUF_SIZE];
     size_t rlen = 0;
-    char lbuf[MAX_PAYLOAD];
-    size_t llen = 0;
 
     struct pollfd pfd[2] = {
         { .fd = STDIN_FILENO, .events = POLLIN },
@@ -450,23 +410,26 @@ int main(int argc, char **argv)
             die("poll");
         }
 
-        /* Uu tien doc socket truoc de khong mat dong cuoi khi server dong */
         if (pfd[1].revents & (POLLIN | POLLHUP | POLLERR)) {
             if (on_socket_readable(fd, rbuf, &rlen) < 0) {
+                if (g_is_tty)
+                    fputs("\r\033[K", stdout);
                 fprintf(stderr, "[client] server da dong ket noi\n");
                 break;
             }
         }
 
         if (pfd[0].fd >= 0 && (pfd[0].revents & (POLLIN | POLLHUP))) {
-            int r = on_stdin_readable(fd, lbuf, &llen);
+            int r = on_stdin_readable(fd);
             if (r < 0) {
+                if (g_is_tty)
+                    fputs("\r\033[K", stdout);
                 fprintf(stderr, "[client] loi gui: %s\n", strerror(errno));
                 break;
             }
-            if (r == 1) {                /* stdin het: bao server, cho no dong */
+            if (r == 1) {
                 shutdown(fd, SHUT_WR);
-                pfd[0].fd = -1;          /* poll bo qua fd am */
+                pfd[0].fd = -1;
             }
         }
     }

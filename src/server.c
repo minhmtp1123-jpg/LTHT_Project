@@ -1,28 +1,33 @@
 /*
  * server.c - Chat server da client dung epoll (non-blocking)
- *            Lang nghe dong thoi tren Unix domain socket va TCP.
+ *            Lang nghe dong thoi tren Unix domain socket va TCP (dual-stack IPv4/IPv6).
  *            Client phai dang nhap (username + mat khau) moi vao duoc phong.
  *
  * Giao thuc: moi tin nhan = [4 byte do dai, big-endian][payload]
- *            (length-prefix framing, payload toi da MAX_PAYLOAD byte)
+ *            (length-prefix framing, payload toi da MAX_PAYLOAD byte tu proto.h)
  *
  * Xac thuc (truoc khi dang nhap chi nhan 2 lenh):
  *   /login <ten> <mat khau>      -> "+OK <ten>"  hoac "-ERR <ly do>"
  *   /register <ten> <mat khau>   -> "+OK <ten>"  hoac "-ERR <ly do>"
+ *
+ * Lenh sau khi dang nhap:
+ *   /list                        -> xem ai dang online
+ *   /msg <ten> <nd>              -> tin nhan rieng tu
+ *   /whoami                      -> thong tin phien cua ban
+ *   /stats                       -> thong ke trang thai may chu
+ *   /passwd <cu> <moi>           -> doi mat khau tai khoan
+ *   /quit                        -> roi phong
+ *   /help                        -> huong dan
  *
  * Tep du lieu (tao tu dong neu chua co, quyen 0600):
  *   users.db  moi dong "ten:hash"  (hash tao bang crypt(3), mac dinh yescrypt)
  *   chat.log  moi dong "YYYY-MM-DD HH:MM:SS<TAB>nguoi_gui<TAB>noi_dung"
  *             nguoi_gui la "*" voi su kien he thong (vao/roi phong).
  *             Tin nhan rieng (/msg) KHONG duoc ghi vao lich su.
- *
- * Build:  gcc -Wall -Wextra -O2 -g -o server server.c -lcrypt
- *         gcc -Wall -Wextra -g -fsanitize=address,undefined -o server server.c -lcrypt
- * Chay:   ./server [-u unix_path] [-p port] [-d users.db] [-l chat.log]
- *         mac dinh: /tmp/chat.sock, 9000, users.db, chat.log
- *         (van chap nhan kieu cu: ./server [unix_path] [port])
  */
 #define _GNU_SOURCE
+#include "proto.h"
+
 #include <arpa/inet.h>
 #include <crypt.h>
 #include <ctype.h>
@@ -49,16 +54,6 @@
 #define DEFAULT_USERS_PATH "users.db"
 #define DEFAULT_HIST_PATH  "chat.log"
 #define MAX_EVENTS         64
-#define MAX_PAYLOAD        4096         /* payload toi da cua 1 frame */
-#define RBUF_SIZE          (4 + MAX_PAYLOAD)
-#define WBUF_LIMIT         (1 << 20)    /* 1 MiB: vuot qua -> ngat client cham */
-#define NICK_MAX           16           /* do dai toi da cua username */
-#define PASS_MIN           6
-#define PASS_MAX           72
-#define MAX_AUTH_FAILS     3            /* sai qua so lan nay -> ngat ket noi */
-#define AUTH_TIMEOUT_SEC   30           /* ket noi chua dang nhap qua lau -> ngat */
-#define HISTORY_REPLAY     20           /* so dong lich su gui lai khi dang nhap */
-#define HISTORY_TAIL_BYTES 32768        /* chi doc phan cuoi tep lich su */
 
 /* ------------------------------------------------------------------ */
 /* Cau truc du lieu                                                    */
@@ -76,8 +71,10 @@ struct handle {
 struct client {
     struct handle h;            /* PHAI la thanh vien dau tien */
     char nick[NICK_MAX + 1];    /* "user<fd>" truoc khi dang nhap, sau do = username */
+    char peer_info[96];         /* Thong tin dia chi/dinh danh doi phuong */
     int is_unix;
     int dead;                   /* da dong fd, cho giai phong cuoi vong lap */
+    int need_leave_notify;      /* co can thong bao roi phong o sweep_dead hay khong */
 
     int authed;                 /* da dang nhap thanh cong chua */
     int auth_fails;             /* so lan xac thuc that bai */
@@ -117,6 +114,9 @@ static int g_users_fd = -1;             /* mo O_APPEND de them tai khoan moi */
 static int g_hist_fd = -1;              /* mo O_APPEND de ghi lich su */
 static char g_dummy_hash[256];          /* bam gia: lam cham dong deu khi user khong ton tai */
 static struct crypt_data g_cd;          /* bo nho cho crypt_r (server don luong) */
+
+static time_t g_start_time = 0;         /* thoi gian bat dau chay server */
+static unsigned long long g_total_messages = 0; /* tong so tin nhan cong khai da phat */
 
 /* ------------------------------------------------------------------ */
 /* Tien ich                                                            */
@@ -210,7 +210,7 @@ static int verify_pass(const char *pass, const char *hash)
 }
 
 /* ------------------------------------------------------------------ */
-/* Tai khoan: nap users.db, them tai khoan moi                         */
+/* Tai khoan: nap users.db, them tai khoan moi, cap nhat mat khau       */
 /* ------------------------------------------------------------------ */
 
 static struct account *acc_find(const char *name)
@@ -318,11 +318,62 @@ static int add_user(const char *name, const char *pass)
     return acc_push(name, hash);
 }
 
+/* Cap nhat mat khau an toan bang atomic write qua file tam */
+static int update_user_password(const char *name, const char *new_pass)
+{
+    struct account *a = acc_find(name);
+    if (!a)
+        return -1;
+
+    char new_hash[256];
+    if (make_hash(new_pass, new_hash, sizeof new_hash) < 0)
+        return -1;
+
+    char *nh = strdup(new_hash);
+    if (!nh)
+        return -1;
+
+    char tmp_path[512];
+    snprintf(tmp_path, sizeof tmp_path, "%s.tmp", g_users_path);
+    FILE *tf = fopen(tmp_path, "w");
+    if (!tf) {
+        free(nh);
+        return -1;
+    }
+    fchmod(fileno(tf), 0600);
+
+    for (size_t i = 0; i < g_nacc; i++) {
+        const char *h = (strcmp(g_acc[i].name, name) == 0) ? new_hash : g_acc[i].hash;
+        if (fprintf(tf, "%s:%s\n", g_acc[i].name, h) < 0) {
+            fclose(tf);
+            unlink(tmp_path);
+            free(nh);
+            return -1;
+        }
+    }
+    fflush(tf);
+    fsync(fileno(tf));
+    fclose(tf);
+
+    if (rename(tmp_path, g_users_path) < 0) {
+        unlink(tmp_path);
+        free(nh);
+        return -1;
+    }
+
+    if (g_users_fd >= 0)
+        close(g_users_fd);
+    g_users_fd = open(g_users_path, O_WRONLY | O_APPEND | O_CLOEXEC, 0600);
+
+    free(a->hash);
+    a->hash = nh;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Lich su chat: chat.log                                              */
 /* ------------------------------------------------------------------ */
 
-/* Ky tu dieu khien (ke ca \n, \t) -> dau cach, de khong lam hong dinh dang tep */
 static void sanitize(char *s)
 {
     for (; *s; s++)
@@ -330,7 +381,6 @@ static void sanitize(char *s)
             *s = ' ';
 }
 
-/* Ghi 1 dong bang 1 lan write() tren fd O_APPEND */
 static void hist_log(const char *who, const char *fmt, ...)
 {
     if (g_hist_fd < 0)
@@ -376,7 +426,6 @@ static void epoll_set_out(struct client *c, int want_out)
     c->want_out = want_out;
 }
 
-/* Chi tim trong cac client DA dang nhap */
 static struct client *find_by_nick(const char *nick)
 {
     for (struct client *c = g_clients; c; c = c->next)
@@ -396,7 +445,6 @@ static int count_authed(void)
 
 static int queue_frame(struct client *c, const char *data, size_t len);
 
-/* Gui mot dong text toi mot client */
 static void send_text(struct client *c, const char *fmt, ...)
 {
     char buf[MAX_PAYLOAD];
@@ -411,7 +459,6 @@ static void send_text(struct client *c, const char *fmt, ...)
     queue_frame(c, buf, (size_t)n);
 }
 
-/* Gui toi tat ca client DA dang nhap (tru `except`, co the NULL) */
 static void broadcast(const struct client *except, const char *fmt, ...)
 {
     char buf[MAX_PAYLOAD];
@@ -430,28 +477,36 @@ static void broadcast(const struct client *except, const char *fmt, ...)
 }
 
 /*
- * Dong fd va danh dau chet. KHONG free o day, vi con co the dang duyet
- * danh sach (broadcast) hoac con con tro trong mang events cua epoll_wait.
- * Viec free thuc su lam o sweep_dead() cuoi moi vong lap.
+ * Dong fd va danh dau chet. KHONG goi broadcast o day de tranh de quy
+ * (reentrancy) khi flush_client bi loi trong luc dang chay broadcast.
+ * Viec broadcast "roi phong" va free thuc su duoc thuc hien o sweep_dead().
  */
 static void kill_client(struct client *c, const char *why)
 {
     if (c->dead)
         return;
     c->dead = 1;
+    c->need_leave_notify = c->authed;
     epoll_ctl(g_ep, EPOLL_CTL_DEL, c->h.fd, NULL);
     close(c->h.fd);
     g_nclients--;
     log_msg("fd=%d (%s) roi di: %s [con %d ket noi]",
             c->h.fd, c->nick, why, g_nclients);
-    if (c->authed) {                        /* chi bao khi da vao phong */
+    if (c->authed)
         hist_log("*", "%s roi phong", c->nick);
-        broadcast(c, "*** %s da roi phong", c->nick);
-    }
 }
 
 static void sweep_dead(void)
 {
+    /* Pha 1: Thong bao cac client roi phong mot cach an toan (khong de quy) */
+    for (struct client *c = g_clients; c; c = c->next) {
+        if (c->dead && c->need_leave_notify) {
+            c->need_leave_notify = 0;
+            broadcast(c, "*** %s da roi phong", c->nick);
+        }
+    }
+
+    /* Pha 2: Giai phong thuc su sau khi da duyet xong */
     struct client *c = g_clients;
     while (c) {
         struct client *next = c->next;
@@ -467,7 +522,6 @@ static void sweep_dead(void)
     }
 }
 
-/* Ngat cac ket noi chua dang nhap sau AUTH_TIMEOUT_SEC giay */
 static void reap_unauthed(void)
 {
     time_t now = time(NULL);
@@ -482,7 +536,6 @@ static void reap_unauthed(void)
 /* Ghi: hang doi + flush khi socket san sang                           */
 /* ------------------------------------------------------------------ */
 
-/* Day het du lieu dang cho. Tra 0 neu ok, -1 neu client da bi kill. */
 static int flush_client(struct client *c)
 {
     while (c->woff < c->wlen) {
@@ -493,29 +546,27 @@ static int flush_client(struct client *c)
                 continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 if (!c->want_out)
-                    epoll_set_out(c, 1);   /* cho EPOLLOUT roi gui tiep */
+                    epoll_set_out(c, 1);
                 return 0;
             }
-            kill_client(c, strerror(errno));   /* EPIPE, ECONNRESET, ... */
+            kill_client(c, strerror(errno));
             return -1;
         }
         c->woff += (size_t)w;
     }
-    /* gui het */
     c->wlen = c->woff = 0;
     if (c->want_out)
         epoll_set_out(c, 0);
     return 0;
 }
 
-/* Dong goi 1 frame [len][data] vao hang doi ghi cua client roi thu gui */
 static int queue_frame(struct client *c, const char *data, size_t len)
 {
     if (c->dead)
         return -1;
 
     size_t pending = c->wlen - c->woff;
-    size_t need = 4 + len;
+    size_t need = HEADER_SIZE + len;
 
     if (pending + need > WBUF_LIMIT) {
         kill_client(c, "buffer ghi tran (client doc qua cham)");
@@ -523,7 +574,7 @@ static int queue_frame(struct client *c, const char *data, size_t len)
     }
 
     if (c->wlen + need > c->wcap) {
-        if (c->woff) {                         /* don cho trong dau buffer */
+        if (c->woff) {
             memmove(c->wbuf, c->wbuf + c->woff, pending);
             c->wlen = pending;
             c->woff = 0;
@@ -542,12 +593,9 @@ static int queue_frame(struct client *c, const char *data, size_t len)
         }
     }
 
-    uint32_t nlen = htonl((uint32_t)len);
-    memcpy(c->wbuf + c->wlen, &nlen, 4);
-    memcpy(c->wbuf + c->wlen + 4, data, len);
+    pack_frame(c->wbuf + c->wlen, c->wcap - c->wlen, data, len);
     c->wlen += need;
 
-    /* Neu da co EPOLLOUT dang cho thi khong can thu gui ngay */
     if (c->want_out)
         return 0;
     return flush_client(c);
@@ -577,20 +625,19 @@ static void send_history(struct client *c)
     buf[n] = '\0';
 
     char *p = buf;
-    if (off > 0) {                       /* dong dau co the bi cat do -> bo */
+    if (off > 0) {
         char *nl = memchr(buf, '\n', (size_t)n);
         if (!nl)
             return;
         p = nl + 1;
     }
 
-    /* Giu con tro toi HISTORY_REPLAY dong cuoi (vong tron) */
     char *ring[HISTORY_REPLAY];
     size_t count = 0;
     while (*p) {
         char *nl = strchr(p, '\n');
         if (!nl)
-            break;                       /* dong chua ghi xong */
+            break;
         *nl = '\0';
         ring[count % HISTORY_REPLAY] = p;
         count++;
@@ -625,7 +672,6 @@ static void send_history(struct client *c)
 /* Xac thuc                                                            */
 /* ------------------------------------------------------------------ */
 
-/* Tach "<user> <pass...>"; mat khau co the chua dau cach */
 static int split_cred(char *args, char **user, char **pass)
 {
     while (*args == ' ')
@@ -655,12 +701,12 @@ static void complete_login(struct client *c, const char *name)
 {
     c->authed = 1;
     c->auth_fails = 0;
-    snprintf(c->nick, sizeof c->nick, "%.*s", NICK_MAX, name);   /* name da kiem tra <= NICK_MAX */
+    snprintf(c->nick, sizeof c->nick, "%.*s", NICK_MAX, name);
     log_msg("fd=%d (%s) dang nhap thanh cong [%d online]",
             c->h.fd, c->nick, count_authed());
 
     send_text(c, "+OK %s", c->nick);
-    send_text(c, "*** Chao mung %s! Go /help de xem lenh.", c->nick);
+    send_text(c, "*** Chao mung %s! Go /help de xem danh sach lenh.", c->nick);
     send_history(c);
     if (c->dead)
         return;
@@ -668,7 +714,6 @@ static void complete_login(struct client *c, const char *name)
     broadcast(c, "*** %s vua vao phong", c->nick);
 }
 
-/* Moi tin nhan cua client CHUA dang nhap di qua day. KHONG ghi mat khau vao log. */
 static void handle_auth(struct client *c, char *msg)
 {
     int reg;
@@ -714,7 +759,6 @@ static void handle_auth(struct client *c, char *msg)
         log_msg("fd=%d dang ky tai khoan moi: %s", c->h.fd, user);
     } else {
         struct account *a = acc_find(user);
-        /* Luon tinh crypt (ke ca khi user khong ton tai) de khong lo thong tin qua thoi gian */
         int ok = verify_pass(pass, a ? a->hash : g_dummy_hash);
         if (!a || !ok) {
             auth_fail(c, "Sai ten dang nhap hoac mat khau");
@@ -734,7 +778,6 @@ static void handle_auth(struct client *c, char *msg)
 
 static void handle_message(struct client *c, char *msg)
 {
-    /* cat khoang trang / xuong dong o cuoi */
     size_t n = strlen(msg);
     while (n > 0 && isspace((unsigned char)msg[n - 1]))
         msg[--n] = '\0';
@@ -746,10 +789,11 @@ static void handle_message(struct client *c, char *msg)
         return;
     }
 
-    if (msg[0] != '/') {                       /* tin thuong -> broadcast + ghi lich su */
+    if (msg[0] != '/') {
         log_msg("[%s] %s", c->nick, msg);
         hist_log(c->nick, "%s", msg);
         broadcast(NULL, "[%s] %s", c->nick, msg);
+        g_total_messages++;
         return;
     }
 
@@ -773,16 +817,62 @@ static void handle_message(struct client *c, char *msg)
             send_text(c, "!! khong tim thay '%s'", to);
             return;
         }
-        /* Tin rieng tu: KHONG ghi vao lich su */
         send_text(dst, "[rieng tu tu %s] %s", c->nick, text);
         send_text(c, "[rieng tu toi %s] %s", dst->nick, text);
+    } else if (strcmp(msg, "/whoami") == 0) {
+        time_t now = time(NULL);
+        long online_sec = (long)(now - c->connected_at);
+        send_text(c, "*** Thong tin phien cua ban:");
+        send_text(c, "    - Username: %s", c->nick);
+        send_text(c, "    - Kenh ket noi: %s", c->is_unix ? "Unix domain socket" : "TCP");
+        send_text(c, "    - Dinh danh: %s", c->peer_info);
+        send_text(c, "    - Thoi gian da online: %ld giay", online_sec);
+    } else if (strcmp(msg, "/stats") == 0) {
+        time_t now = time(NULL);
+        long up = (long)(now - g_start_time);
+        send_text(c, "*** Thong ke trang thai may chu:");
+        send_text(c, "    - Thoi gian chay (uptime): %ld gio %ld phut %ld giay",
+                  up / 3600, (up % 3600) / 60, up % 60);
+        send_text(c, "    - Ket noi dang mo: %d | User dang online: %d",
+                  g_nclients, count_authed());
+        send_text(c, "    - Tong so tai khoan da dang ky: %zu", g_nacc);
+        send_text(c, "    - Tong tin nhan broadcast: %llu", g_total_messages);
+    } else if (strncmp(msg, "/passwd ", 8) == 0) {
+        char *args = msg + 8;
+        char *oldp, *newp;
+        if (split_cred(args, &oldp, &newp) < 0) {
+            send_text(c, "!! Cu phap: /passwd <mat_khau_cu> <mat_khau_moi>");
+            return;
+        }
+        struct account *a = acc_find(c->nick);
+        if (!a || !verify_pass(oldp, a->hash)) {
+            send_text(c, "-ERR Mat khau cu khong dung");
+            explicit_bzero(oldp, strlen(oldp));
+            explicit_bzero(newp, strlen(newp));
+            return;
+        }
+        size_t nl = strlen(newp);
+        if (nl < PASS_MIN || nl > PASS_MAX) {
+            send_text(c, "-ERR Mat khau moi phai tu %d den %d ky tu", PASS_MIN, PASS_MAX);
+            explicit_bzero(oldp, strlen(oldp));
+            explicit_bzero(newp, strlen(newp));
+            return;
+        }
+        if (update_user_password(c->nick, newp) < 0) {
+            send_text(c, "-ERR Loi may chu khi cap nhat mat khau");
+        } else {
+            log_msg("fd=%d (%s) da doi mat khau thanh cong", c->h.fd, c->nick);
+            send_text(c, "+OK Doi mat khau thanh cong!");
+        }
+        explicit_bzero(oldp, strlen(oldp));
+        explicit_bzero(newp, strlen(newp));
     } else if (strcmp(msg, "/help") == 0) {
-        send_text(c, "*** /list | /msg <ten> <nd> | /quit | /help");
+        send_text(c, "*** Cac lenh ho tro: /list | /msg <ten> <nd> | /whoami | /stats | /passwd <cu> <moi> | /quit | /help");
     } else if (strcmp(msg, "/quit") == 0) {
         send_text(c, "*** tam biet!");
         kill_client(c, "/quit");
     } else {
-        send_text(c, "!! lenh khong ro, go /help");
+        send_text(c, "!! lenh khong ro, go /help de xem danh sach");
     }
 }
 
@@ -808,32 +898,30 @@ static void on_readable(struct client *c)
     }
     c->rlen += (size_t)n;
 
-    /* Tach tat ca frame hoan chinh dang co trong buffer */
     size_t off = 0;
-    while (c->rlen - off >= 4) {
+    while (c->rlen - off >= HEADER_SIZE) {
         uint32_t len;
-        memcpy(&len, c->rbuf + off, 4);
+        memcpy(&len, c->rbuf + off, HEADER_SIZE);
         len = ntohl(len);
 
         if (len == 0 || len > MAX_PAYLOAD) {
             kill_client(c, "frame khong hop le (sai do dai)");
             return;
         }
-        if (c->rlen - off < 4 + (size_t)len)
-            break;                              /* frame chua den du */
+        if (c->rlen - off < HEADER_SIZE + (size_t)len)
+            break;
 
         char msg[MAX_PAYLOAD + 1];
-        memcpy(msg, c->rbuf + off + 4, len);
+        memcpy(msg, c->rbuf + off + HEADER_SIZE, len);
         msg[len] = '\0';
-        off += 4 + (size_t)len;
+        off += HEADER_SIZE + (size_t)len;
 
         handle_message(c, msg);
-        explicit_bzero(msg, sizeof msg);        /* co the chua mat khau */
+        explicit_bzero(msg, sizeof msg);
         if (c->dead)
             return;
     }
 
-    /* Giu lai phan du (frame dang do) o dau buffer, xoa sach phan da xu ly */
     if (off) {
         memmove(c->rbuf, c->rbuf + off, c->rlen - off);
         c->rlen -= off;
@@ -893,10 +981,22 @@ static void accept_clients(struct handle *lh)
                 struct sockaddr_in *a = (struct sockaddr_in *)&ss;
                 inet_ntop(AF_INET, &a->sin_addr, ip, sizeof ip);
                 snprintf(who, sizeof who, "tcp %s:%u", ip, ntohs(a->sin_port));
+            } else if (ss.ss_family == AF_INET6) {
+                struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)&ss;
+                if (IN6_IS_ADDR_V4MAPPED(&a6->sin6_addr)) {
+                    struct in_addr a4;
+                    memcpy(&a4, &a6->sin6_addr.s6_addr[12], sizeof a4);
+                    inet_ntop(AF_INET, &a4, ip, sizeof ip);
+                    snprintf(who, sizeof who, "tcp %s:%u (v4)", ip, ntohs(a6->sin6_port));
+                } else {
+                    inet_ntop(AF_INET6, &a6->sin6_addr, ip, sizeof ip);
+                    snprintf(who, sizeof who, "tcp [%s]:%u", ip, ntohs(a6->sin6_port));
+                }
             } else {
                 snprintf(who, sizeof who, "tcp");
             }
         }
+        snprintf(c->peer_info, sizeof c->peer_info, "%s", who);
 
         struct epoll_event ev;
         memset(&ev, 0, sizeof ev);
@@ -909,7 +1009,6 @@ static void accept_clients(struct handle *lh)
             continue;
         }
 
-        /* them vao dau danh sach */
         c->next = g_clients;
         if (g_clients)
             g_clients->prev = c;
@@ -939,13 +1038,13 @@ static int make_unix_listener(const char *path)
     if (fd < 0)
         die("socket(AF_UNIX)");
 
-    unlink(path);                               /* xoa file cu neu con sot */
+    unlink(path);
     memset(&addr, 0, sizeof addr);
     addr.sun_family = AF_UNIX;
     strcpy(addr.sun_path, path);
     if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0)
         die("bind(unix)");
-    chmod(path, 0666);                          /* cho user khac ket noi duoc */
+    chmod(path, 0666);
     if (listen(fd, SOMAXCONN) < 0)
         die("listen(unix)");
     return fd;
@@ -953,7 +1052,28 @@ static int make_unix_listener(const char *path)
 
 static int make_tcp_listener(uint16_t port)
 {
-    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    /* Uu tien socket dual-stack IPv6 neu ho tro */
+    int fd = socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd >= 0) {
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        int zero = 0;
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &zero, sizeof zero);
+
+        struct sockaddr_in6 addr6;
+        memset(&addr6, 0, sizeof addr6);
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_addr = in6addr_any;
+        addr6.sin6_port = htons(port);
+        if (bind(fd, (struct sockaddr *)&addr6, sizeof addr6) == 0) {
+            if (listen(fd, SOMAXCONN) == 0)
+                return fd;
+        }
+        close(fd);
+    }
+
+    /* Fallback sang IPv4 thuan neu he thong khong ho tro IPv6 */
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (fd < 0)
         die("socket(AF_INET)");
 
@@ -1025,7 +1145,6 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
     }
-    /* Kieu cu: ./server [unix_path] [port] */
     if (optind < argc)
         g_unix_path = argv[optind];
     if (optind + 1 < argc) {
@@ -1036,9 +1155,6 @@ int main(int argc, char **argv)
         }
     }
 
-    /* SIGPIPE: bo qua (da co MSG_NOSIGNAL, day la lop bao ve thu hai).
-     * SIGINT/SIGTERM: dat co g_stop; KHONG dung SA_RESTART de epoll_wait
-     * tra ve EINTR va vong lap thoat duoc. */
     signal(SIGPIPE, SIG_IGN);
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -1047,7 +1163,6 @@ int main(int argc, char **argv)
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 
-    /* Du lieu: tai khoan + lich su */
     load_users();
     g_hist_fd = open(g_hist_path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
     if (g_hist_fd < 0)
@@ -1067,12 +1182,13 @@ int main(int argc, char **argv)
     add_listener(&g_lunix);
     add_listener(&g_ltcp);
 
+    g_start_time = time(NULL);
+
     log_msg("server san sang: unix=%s tcp=:%d users=%s lich_su=%s (Ctrl+C de dung)",
             g_unix_path, port, g_users_path, g_hist_path);
 
     struct epoll_event evs[MAX_EVENTS];
     while (!g_stop) {
-        /* timeout 1s de dinh ky ngat cac ket noi chua dang nhap qua lau */
         int n = epoll_wait(g_ep, evs, MAX_EVENTS, 1000);
         if (n < 0) {
             if (errno == EINTR)
@@ -1103,14 +1219,18 @@ int main(int argc, char **argv)
         }
 
         reap_unauthed();
-        sweep_dead();   /* chi free sau khi het batch event */
+        sweep_dead();
     }
 
-    /* Don dep */
-    log_msg("dang tat server...");
-    for (struct client *c = g_clients; c; c = c->next)
-        if (!c->dead)
+    /* Graceful Shutdown: Thong bao truoc khi dong ket noi */
+    log_msg("dang tat server, thong bao cho tat ca client...");
+    broadcast(NULL, "*** May chu dang tat de bao tri (shutdown). Tam biet!");
+    for (struct client *c = g_clients; c; c = c->next) {
+        if (!c->dead) {
+            flush_client(c);
             close(c->h.fd);
+        }
+    }
     while (g_clients) {
         struct client *next = g_clients->next;
         explicit_bzero(g_clients->rbuf, sizeof g_clients->rbuf);
@@ -1127,5 +1247,6 @@ int main(int argc, char **argv)
     close(g_users_fd);
     close(g_hist_fd);
     unlink(g_unix_path);
+    log_msg("server da tat hoan toan.");
     return EXIT_SUCCESS;
 }

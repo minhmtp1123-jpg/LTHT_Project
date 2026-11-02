@@ -169,6 +169,9 @@ sequenceDiagram
 | `nội dung bất kỳ` | Gửi cho mọi người (broadcast), có ghi vào lịch sử |
 | `/list` | Liệt kê người đang online kèm loại kết nối (`unix` hoặc `tcp`) |
 | `/msg <tên> <nội dung>` | Tin nhắn riêng, **không** ghi vào lịch sử |
+| `/whoami` | Xem thông tin chi tiết phiên kết nối (username, kênh, địa chỉ/PID/UID, uptime) |
+| `/stats` | Xem thống kê máy chủ (thời gian chạy, kết nối, user online, tổng tin nhắn) |
+| `/passwd <cũ> <mới>` | Đổi mật khẩu tài khoản trực tiếp (cập nhật an toàn vào `users.db`) |
 | `/help` | Xem danh sách lệnh |
 | `/quit` | Thoát |
 
@@ -206,20 +209,24 @@ Khi đăng nhập, server đọc phần cuối của `chat.log` và gửi lại 
 
 ```
 .
-├── Makefile
-├── server.c       epoll loop, quản lý client, buffer đọc/ghi
-├── client.c       poll() trên stdin + socket (Unix hoặc TCP)
-├── bench.c        benchmark độ trễ và thông lượng các cơ chế IPC
-├── plot.py        vẽ biểu đồ từ results.csv
-├── docs/          ảnh sơ đồ (architecture, event-loop, message-flow, auth-flow) cho báo cáo và slide
-└── README.md
-
-Tạo ra khi chạy (không đưa vào git):
-├── users.db       tài khoản: tên:hash
-└── chat.log       lịch sử trò chuyện
+├── .gitignore     loại trừ binary, log và file db khỏi kho mã
+├── README.md      tài liệu tổng quan đồ án
+├── docs/
+│   ├── BaoCao.md  báo cáo chi tiết đồ án (kiến trúc, benchmark, phân tích)
+│   ├── Phan_tich_du_an.md phân tích kỹ thuật và kiến thức hệ thống
+│   └── Bao_cao_Sockets_trong_IPC_-_Chat_server_da_client_bang_epoll.docx
+└── src/
+    ├── Makefile   kịch bản biên dịch (make, make debug, make clean)
+    ├── proto.h    định nghĩa giao thức frame và các hằng số chung
+    ├── proto.c    hàm đóng gói/giải mã frame và I/O an toàn (write_full, read_exact)
+    ├── server.c   epoll loop non-blocking, quản lý client, xác thực, lịch sử chat
+    ├── client.c   poll() stdin + socket, ANSI line management, ẩn mật khẩu
+    ├── bench.c    benchmark độ trễ và thông lượng các cơ chế IPC
+    ├── plot.py    vẽ biểu đồ trực quan hóa kết quả đo
+    ├── results.csv kết quả đo benchmark
+    ├── latency.png biểu đồ độ trễ
+    └── throughput.png biểu đồ thông lượng
 ```
-
-> Nên thêm `users.db` và `chat.log` vào `.gitignore` để không đẩy tài khoản và tin nhắn lên kho mã.
 
 ---
 
@@ -358,11 +365,11 @@ Môi trường máy ảo thường cho số nhiễu và không phản ánh phầ
 
 1. **Buffer đọc riêng cho từng client** (`rbuf`, `rlen`). Một `read()` có thể ra nửa frame hoặc nhiều frame. `on_readable()` tách mọi frame đã đủ rồi `memmove` phần dư về đầu buffer.
 2. **Buffer ghi riêng cho từng client** (`wbuf`, `woff`, `wlen`). Khi `send()` trả `EAGAIN`, phần chưa gửi được giữ lại và server đăng ký thêm `EPOLLOUT`; khi socket ghi được thì `flush_client()` gửi tiếp. Nếu hàng đợi của một client vượt 1 MiB (đọc quá chậm), server ngắt client đó để không phình bộ nhớ.
-3. **Giải phóng client an toàn.** `kill_client()` chỉ đóng fd và đánh dấu `dead`; việc `free` thật nằm ở `sweep_dead()` cuối mỗi vòng lặp. Lý do: mảng sự kiện của `epoll_wait` hoặc vòng lặp `broadcast` có thể còn giữ con trỏ tới client vừa chết, và `free` sớm gây use-after-free.
+3. **Giải phóng client và phát thông báo an toàn (khử reentrancy).** `kill_client()` chỉ đóng fd, đánh dấu `dead` và bật cờ `need_leave_notify`. Việc phát thông báo rời phòng `*** user da roi phong` và giải phóng bộ nhớ được dời về `sweep_dead()` ở cuối vòng lặp. Cách này loại bỏ hoàn toàn nguy cơ đệ quy (reentrancy hazard) khi một client bị ngắt trong lúc server đang lặp broadcast tới các client khác.
 4. **`struct handle` đứng đầu mọi đối tượng trong epoll**, nên `data.ptr` đủ để phân biệt listener Unix, listener TCP và client.
 5. **Level-triggered**, mỗi sự kiện chỉ `read()` một lượt cho mỗi client. Cách này đơn giản và công bằng giữa các client. Nếu chuyển sang edge-triggered thì bắt buộc phải đọc đến khi gặp `EAGAIN`.
 6. **Chi tiết hệ thống**: `accept4` với `SOCK_NONBLOCK | SOCK_CLOEXEC`; `MSG_NOSIGNAL` cùng bỏ qua `SIGPIPE`; `SO_REUSEADDR` cho cổng TCP; `unlink` file socket cũ trước khi `bind` và khi thoát; kiểm tra độ dài `sun_path`; `TCP_NODELAY`; `SO_PEERCRED` để ghi PID/UID của client Unix; `SIGINT`/`SIGTERM` đặt cờ dừng (không dùng `SA_RESTART` để `epoll_wait` trả về `EINTR`).
-7. **Client** dùng `poll()` trên stdin và socket, đọc stdin bằng `read()` chứ không dùng stdio để tránh dữ liệu nằm kẹt trong buffer của stdio mà `poll()` không thấy.
+7. **Client và ANSI Line Management.** Client dùng `poll()` trên stdin và socket, đọc stdin bằng `read()` chứ không dùng stdio. Đồng thời tích hợp cơ chế điều khiển ANSI (`\r\033[K`) để khi có tin nhắn mới từ phòng chat gửi đến không đè lên dòng văn bản người dùng đang nhập dở.
 8. **Lưu mật khẩu.** Server không bao giờ lưu mật khẩu thô: `make_hash()` sinh salt ngẫu nhiên bằng `getrandom` rồi băm bằng `crypt_r` (yescrypt, chi phí tính toán cao để chống dò mật khẩu hàng loạt khi file bị lộ). `verify_pass()` so khớp bằng phép so sánh thời gian cố định. Với tên không tồn tại, server vẫn tính một lần `crypt` với hash giả để thời gian phản hồi không tiết lộ tên nào có thật.
 9. **Trạng thái đăng nhập từng client** (`authed`, `auth_fails`, `connected_at`). Client chưa đăng nhập không nhận broadcast, không có trong `/list`, và bị ngắt sau 3 lần sai hoặc sau 30 giây im lặng. `epoll_wait` dùng timeout 1 giây để định kỳ dọn các kết nối này.
 10. **Dọn dấu vết mật khẩu trong bộ nhớ.** Sau khi xử lý mỗi frame, server `explicit_bzero` bản sao tin nhắn và vùng đã dùng của `rbuf`; client xóa mật khẩu khỏi bộ nhớ ngay sau khi gửi. Mật khẩu không bao giờ được ghi vào log hay `chat.log`.
