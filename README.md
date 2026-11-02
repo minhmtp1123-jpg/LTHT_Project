@@ -1,27 +1,29 @@
 # Chat server đa client bằng `epoll` — Sockets trong IPC
 
-Đồ án cuối kỳ môn **Lập trình hệ thống** · Ngôn ngữ **C** · Nền tảng **Linux (Arch)**
+Đồ án cuối kỳ môn **Lập trình hệ thống** · Ngôn ngữ **C** · Nền tảng **Linux (Arch / Ubuntu)**
 
 Một chat server đơn tiến trình, đơn luồng, phục vụ **đồng thời** client kết nối qua
-**Unix domain socket** (`AF_UNIX`) và **TCP** (`AF_INET`) bằng cơ chế `epoll` non-blocking.
-Client phải **đăng nhập bằng username và mật khẩu** mới vào được phòng: tài khoản lưu trong file
-`users.db` (mật khẩu được băm, không lưu dạng thô), mọi tin nhắn công khai được ghi vào `chat.log`
-và gửi lại cho người vừa đăng nhập.
-Kèm chương trình **benchmark** so sánh độ trễ và thông lượng của các cơ chế IPC:
-pipe, Unix stream, Unix datagram, Unix seqpacket và TCP loopback.
+**Unix domain socket** (`AF_UNIX`) và **TCP** (`AF_INET` / `AF_INET6` dual-stack) bằng cơ chế `epoll` non-blocking.
+Client phải **đăng ký / đăng nhập bằng username và mật khẩu** mới vào được phòng: tài khoản lưu trong file
+`users.db` (mật khẩu được băm bằng thuật toán `yescrypt`, không lưu dạng thô), mọi tin nhắn công khai được ghi vào `chat.log`
+(append-only) và tự động phát lại 20 dòng gần nhất cho người vừa đăng nhập.
+Kèm chương trình **benchmark** so sánh độ trễ và thông lượng của **6 cơ chế IPC**:
+pipe, Unix stream, Unix datagram, Unix seqpacket, TCP loopback và POSIX Shared Memory (`shm`).
+Tích hợp sẵn bộ kịch bản **kiểm thử tự động** (`make test`) bao quát 12 trường hợp kiểm thử.
 
 ## Mục lục
 
 1. [Socket trong bức tranh IPC](#1-socket-trong-bức-tranh-ipc)
-2. [Kiến trúc](#2-kiến-trúc)
-3. [Giao thức](#3-giao-thức)
+2. [Kiến trúc hệ thống](#2-kiến-trúc-hệ-thống)
+3. [Giao thức và Xác thực](#3-giao-thức-và-xác-thực)
 4. [Cấu trúc thư mục](#4-cấu-trúc-thư-mục)
 5. [Build và chạy](#5-build-và-chạy)
-6. [Kịch bản demo](#6-kịch-bản-demo)
-7. [Benchmark](#7-benchmark)
-8. [Ghi chú thiết kế](#8-ghi-chú-thiết-kế)
-9. [Hạn chế](#9-hạn-chế)
-10. [Xử lý sự cố](#10-xử-lý-sự-cố)
+6. [Kịch bản kiểm thử tự động](#6-kịch-bản-kiểm-thử-tự-động)
+7. [Kịch bản demo](#7-kịch-bản-demo)
+8. [Benchmark hiệu năng IPC](#8-benchmark-hiệu-năng-ipc)
+9. [Ghi chú thiết kế hệ thống](#9-ghi-chú-thiết-kế-hệ-thống)
+10. [Hạn chế và Hướng phát triển](#10-hạn-chế-và-hướng-phát-triển)
+11. [Xử lý sự cố](#11-xử-lý-sự-cố)
 
 ---
 
@@ -31,23 +33,23 @@ pipe, Unix stream, Unix datagram, Unix seqpacket và TCP loopback.
 |---|---|---|---|---|
 | Pipe / FIFO | Cùng máy | Một chiều | Không (byte stream) | Pipe cần quan hệ cha-con; FIFO có tên trong hệ thống file |
 | Message queue (POSIX/SysV) | Cùng máy | Hai chiều qua hàng đợi | Có | Có độ ưu tiên; giới hạn kích thước theo cấu hình hệ điều hành |
-| Shared memory | Cùng máy | Hai chiều | Tự quản | Nhanh nhất vì không sao chép, nhưng phải tự đồng bộ (semaphore/mutex) |
+| **Shared memory (POSIX shm)** | Cùng máy | Hai chiều | Tự quản | Nhanh nhất vì dữ liệu không copy qua kernel, đồng bộ bằng Semaphore |
 | **Unix domain socket** | Cùng máy | Hai chiều | Tùy loại (`STREAM` không, `DGRAM`/`SEQPACKET` có) | Có địa chỉ là đường dẫn file, có thể truyền file descriptor (`SCM_RIGHTS`), đọc được PID/UID của đối phương (`SO_PEERCRED`) |
-| **TCP/UDP socket** | Khác máy | Hai chiều | `TCP` không, `UDP` có | Đi qua network stack, dùng được qua mạng |
+| **TCP/UDP socket** | Khác máy hoặc nội bộ | Hai chiều | `TCP` không, `UDP` có | Đi qua network stack, dùng được qua mạng |
 
-Đồ án dùng hai loại socket đầu và cuối: **`AF_UNIX` + `SOCK_STREAM`** và **`AF_INET` + `SOCK_STREAM`**.
+Đồ án dùng hai loại socket chính: **`AF_UNIX` + `SOCK_STREAM`** và **`AF_INET`/`AF_INET6` + `SOCK_STREAM`**.
 Vì cả hai đều là byte stream nên một `read()` **không** tương ứng với một tin nhắn;
-đó là lý do giao thức có *framing* (xem [mục 3](#3-giao-thức)).
+đó là lý do giao thức có *framing* (xem [mục 3](#3-giao-thức-và-xác-thực)).
 
 ---
 
-## 2. Kiến trúc
+## 2. Kiến trúc hệ thống
 
 ### 2.1 Thành phần
 
 ```mermaid
 flowchart LR
-    subgraph CL["Client (mỗi client là một tiến trình)"]
+    subgraph CL["Client (mỗi client là một tiến trình riêng)"]
         C1["client unix<br/>alice"]
         C2["client unix<br/>bob"]
         C3["client tcp<br/>carol"]
@@ -55,13 +57,13 @@ flowchart LR
 
     subgraph SV["server (1 tiến trình, 1 luồng)"]
         LU["Listener AF_UNIX<br/>/tmp/chat.sock"]
-        LT["Listener AF_INET<br/>cổng 9000"]
+        LT["Listener TCP Dual-Stack<br/>cổng 9000 (IPv4/IPv6)"]
         EP{{"epoll<br/>epoll_wait"}}
         subgraph ST["Trạng thái riêng của mỗi client"]
             RB["rbuf<br/>gom byte, tách frame"]
-            WB["wbuf<br/>hàng đợi ghi"]
+            WB["wbuf<br/>hàng đợi ghi non-blocking"]
         end
-        HM["handle_message<br/>/nick /list /msg /quit<br/>và broadcast"]
+        HM["handle_message<br/>xác thực / list / msg / whoami<br/>stats / passwd / quit / broadcast"]
     end
 
     C1 -- "Unix socket" --> LU
@@ -83,17 +85,17 @@ Mỗi đối tượng đăng ký vào epoll bắt đầu bằng `struct handle {
 
 ```mermaid
 flowchart TD
-    A["epoll_wait"] --> B{"fd thuộc loại nào?"}
+    A["epoll_wait (timeout 1s)"] --> B{"fd thuộc loại nào?"}
     B -- "listener" --> C["accept4 lặp đến EAGAIN<br/>tạo client, epoll_ctl ADD"]
     B -- "client" --> D{"sự kiện"}
     D -- "EPOLLIN" --> E["read vào rbuf<br/>tách mọi frame đủ<br/>gọi handle_message"]
     D -- "EPOLLOUT" --> F["flush_client<br/>gửi tiếp phần còn trong wbuf"]
-    D -- "EPOLLERR hoặc EPOLLHUP" --> G["kill_client<br/>đóng fd, đánh dấu dead"]
+    D -- "EPOLLERR hoặc EPOLLHUP" --> G["kill_client<br/>đóng fd, đánh dấu dead = 1<br/>và cờ need_leave_notify"]
     C --> H
     E --> H
     F --> H
     G --> H
-    H["sweep_dead<br/>free các client đã chết"] --> A
+    H["sweep_dead<br/>1. broadcast người rời phòng an toàn<br/>2. free thực sự các client đã chết"] --> A
 ```
 
 ### 2.3 Đường đi của một tin nhắn
@@ -105,6 +107,7 @@ sequenceDiagram
     participant B as Client B
     A->>S: frame: len=11, "hello world"
     Note over S: EPOLLIN: read vào rbuf<br/>đủ một frame thì<br/>gọi handle_message
+    Note over S: Ghi tin nhắn vào chat.log
     S->>A: frame: "[alice] hello world"
     S->>B: frame: "[alice] hello world"
     Note over S,B: Nếu send trả EAGAIN thì giữ phần chưa gửi<br/>trong wbuf, đăng ký thêm EPOLLOUT<br/>và gửi tiếp khi socket sẵn sàng
@@ -112,7 +115,7 @@ sequenceDiagram
 
 ---
 
-## 3. Giao thức
+## 3. Giao thức và Xác thực
 
 Mỗi tin nhắn là một **frame** với tiền tố độ dài (*length-prefix framing*):
 
@@ -127,13 +130,12 @@ Mỗi tin nhắn là một **frame** với tiền tố độ dài (*length-prefi
 
 - `len` là số nguyên 32 bit **big-endian** (`htonl`/`ntohl`), chỉ tính độ dài payload.
 - Payload là văn bản, **không** có ký tự kết thúc `\0`.
-- Server **ngắt** client nếu `len == 0` hoặc `len > 4096` (chống client gửi độ dài giả để ép server cấp bộ nhớ).
-- Vì TCP và `SOCK_STREAM` là dòng byte, một frame có thể đến thành nhiều mẩu, hoặc nhiều frame đến chung một lần `read()`. Cả server lẫn client đều gom byte vào buffer rồi mới tách frame.
+- Server **ngắt** client nếu `len == 0` hoặc `len > 4096` (chống client gửi độ dài giả để ép server cấp phát bộ nhớ).
+- Vì TCP và `SOCK_STREAM` là dòng byte, một frame có thể đến thành nhiều mẩu, hoặc nhiều frame đến chung một lần `read()`. Cả server lẫn client đều gom byte vào buffer rồi mới tách frame qua module dùng chung [`src/proto.c`](src/proto.c).
 
 ### Xác thực
 
-Vừa kết nối, client ở trạng thái **chưa đăng nhập**: server chỉ chấp nhận hai lệnh dưới đây,
-mọi thứ khác bị từ chối và client không nhận được tin của phòng.
+Vừa kết nối, client ở trạng thái **chưa đăng nhập**: server chỉ chấp nhận hai lệnh dưới đây, mọi thứ khác bị từ chối và client không nhận được tin của phòng:
 
 | Lệnh | Tác dụng | Phản hồi |
 |---|---|---|
@@ -144,9 +146,9 @@ mọi thứ khác bị từ chối và client không nhận được tin của p
 sequenceDiagram
     participant C as client
     participant S as server
-    S->>C: Cần đăng nhập, gửi ngay khi vừa kết nối
-    C->>S: /login alice mật khẩu, hoặc /register
-    Note over S: Tìm tài khoản trong users.db.<br/>crypt_r so khớp với hash đã lưu.<br/>Luôn tính crypt, kể cả khi sai tên.
+    S->>C: Yêu cầu đăng nhập, gửi ngay khi vừa kết nối
+    C->>S: /login alice mật_khẩu, hoặc /register
+    Note over S: Tìm tài khoản trong users.db.<br/>crypt_r so khớp với hash đã lưu.<br/>Luôn tính crypt_r kể cả khi sai tên (chống timing attack).
     alt Đúng
         S->>C: +OK alice
         S->>C: Lời chào và 20 dòng lịch sử gần nhất
@@ -157,8 +159,8 @@ sequenceDiagram
     end
 ```
 
-- Tên đăng nhập chỉ gồm `A-Z a-z 0-9 _`, tối đa 16 ký tự. Mật khẩu dài 6 đến 72 ký tự và được phép chứa dấu cách (nhưng không có dấu cách ở cuối).
-- Lỗi đăng nhập luôn là một câu chung ("Sai tên đăng nhập hoặc mật khẩu"), không cho biết tên có tồn tại hay không.
+- Tên đăng nhập chỉ gồm `A-Z a-z 0-9 _`, tối đa 16 ký tự. Mật khẩu dài 6 đến 72 ký tự và được phép chứa dấu cách.
+- Lỗi đăng nhập luôn là câu chung ("Sai tên đăng nhập hoặc mật khẩu"), không làm lộ tên người dùng tồn tại.
 - Một tài khoản chỉ đăng nhập ở một nơi tại một thời điểm.
 - Client (`./client`) tự lo bước này: hỏi tên và mật khẩu (ẩn ký tự khi gõ), gửi lệnh, đợi `+OK`, và hỏi lại nếu bị từ chối.
 
@@ -166,21 +168,20 @@ sequenceDiagram
 
 | Nhập | Tác dụng |
 |---|---|
-| `nội dung bất kỳ` | Gửi cho mọi người (broadcast), có ghi vào lịch sử |
+| `nội dung bất kỳ` | Gửi cho mọi người (broadcast), có ghi vào lịch sử `chat.log` |
 | `/list` | Liệt kê người đang online kèm loại kết nối (`unix` hoặc `tcp`) |
-| `/msg <tên> <nội dung>` | Tin nhắn riêng, **không** ghi vào lịch sử |
-| `/whoami` | Xem thông tin chi tiết phiên kết nối (username, kênh, địa chỉ/PID/UID, uptime) |
-| `/stats` | Xem thống kê máy chủ (thời gian chạy, kết nối, user online, tổng tin nhắn) |
-| `/passwd <cũ> <mới>` | Đổi mật khẩu tài khoản trực tiếp (cập nhật an toàn vào `users.db`) |
-| `/help` | Xem danh sách lệnh |
-| `/quit` | Thoát |
+| `/msg <tên> <nội dung>` | Tin nhắn riêng tư, **không** ghi vào lịch sử |
+| `/whoami` | Xem thông tin chi tiết phiên kết nối (username, kênh, địa chỉ/PID/UID, thời gian online) |
+| `/stats` | Xem thống kê máy chủ (thời gian chạy uptime, số kết nối, user online, tổng tin nhắn) |
+| `/passwd <cũ> <mới>` | Đổi mật khẩu tài khoản trực tiếp (cập nhật nguyên tử vào `users.db`) |
+| `/help` | Xem danh sách lệnh hỗ trợ |
+| `/quit` | Thoát khỏi phòng chat |
 
-Tên hiển thị chính là tên đăng nhập, nên không còn lệnh đổi tên.
+Tên hiển thị chính là tên đăng nhập đã xác thực.
 
 ### Tệp dữ liệu
 
-Cả hai tệp được tạo tự động ở lần chạy đầu với quyền `0600`. Nếu tệp đã có với quyền rộng hơn,
-server cảnh báo và đặt lại `0600`.
+Cả hai tệp được tạo tự động ở lần chạy đầu với quyền `0600`. Nếu tệp đã có với quyền rộng hơn, server cảnh báo và siết lại `0600`.
 
 **`users.db`**: mỗi dòng một tài khoản, dạng `tên:hash`. Hash do `crypt(3)` của libxcrypt sinh ra
 (mặc định **yescrypt**, có salt ngẫu nhiên riêng cho mỗi tài khoản, dự phòng SHA-512), nên mật khẩu
@@ -201,7 +202,7 @@ Người gửi là `*` với sự kiện hệ thống (vào hoặc rời phòng)
 2026-10-25 15:43:40	*	carol roi phong
 ```
 
-Khi đăng nhập, server đọc phần cuối của `chat.log` và gửi lại tối đa 20 dòng gần nhất cho người đó.
+Khi đăng nhập, server đọc phần cuối của `chat.log` bằng `pread` và gửi lại tối đa 20 dòng gần nhất cho người đó.
 
 ---
 
@@ -209,19 +210,20 @@ Khi đăng nhập, server đọc phần cuối của `chat.log` và gửi lại 
 
 ```
 .
-├── .gitignore     loại trừ binary, log và file db khỏi kho mã
-├── README.md      tài liệu tổng quan đồ án
+├── .gitignore     loại trừ binary, log và file db khỏi kho mã git
+├── README.md      tài liệu hướng dẫn tổng quan đồ án
 ├── docs/
-│   ├── BaoCao.md  báo cáo chi tiết đồ án (kiến trúc, benchmark, phân tích)
-│   ├── Phan_tich_du_an.md phân tích kỹ thuật và kiến thức hệ thống
+│   ├── BaoCao.md  báo cáo chi tiết đồ án (kiến trúc, benchmark, phân tích số liệu)
+│   ├── Phan_tich_du_an.md phân tích kỹ thuật và kiến thức lập trình hệ thống
 │   └── Bao_cao_Sockets_trong_IPC_-_Chat_server_da_client_bang_epoll.docx
 └── src/
-    ├── Makefile   kịch bản biên dịch (make, make debug, make clean)
+    ├── Makefile   kịch bản biên dịch (make, make debug, make test, make clean)
     ├── proto.h    định nghĩa giao thức frame và các hằng số chung
     ├── proto.c    hàm đóng gói/giải mã frame và I/O an toàn (write_full, read_exact)
     ├── server.c   epoll loop non-blocking, quản lý client, xác thực, lịch sử chat
     ├── client.c   poll() stdin + socket, ANSI line management, ẩn mật khẩu
-    ├── bench.c    benchmark độ trễ và thông lượng các cơ chế IPC
+    ├── bench.c    benchmark độ trễ và thông lượng 6 cơ chế IPC (kèm Shared Memory)
+    ├── test.sh    kịch bản kiểm thử tích hợp tự động (12 test cases)
     ├── plot.py    vẽ biểu đồ trực quan hóa kết quả đo
     ├── results.csv kết quả đo benchmark
     ├── latency.png biểu đồ độ trễ
@@ -232,47 +234,78 @@ Khi đăng nhập, server đọc phần cuối của `chat.log` và gửi lại 
 
 ## 5. Build và chạy
 
-### Yêu cầu (Arch Linux)
+### Yêu cầu hệ thống
 
-```bash
-sudo pacman -S base-devel gdb valgrind strace socat tmux python-matplotlib
-```
-
-`python-matplotlib` chỉ cần cho `plot.py`; các gói còn lại phục vụ build, gỡ lỗi và demo.
-Server còn cần thư viện `libxcrypt` (liên kết bằng `-lcrypt`, Arch thường đã cài sẵn cùng `base`);
-nếu thiếu `crypt.h` khi build thì cài `libxcrypt`.
+- **Arch Linux**:
+  ```bash
+  sudo pacman -S base-devel libxcrypt gdb valgrind strace socat tmux python-matplotlib
+  ```
+- **Ubuntu / Debian**:
+  ```bash
+  sudo apt-get update && sudo apt-get install -y build-essential libcrypt-dev python3 python3-matplotlib
+  ```
 
 ### Build
 
 ```bash
 make            # bản -O2, không sanitizer (dùng cho demo và benchmark)
-make debug      # server và client với ASan + UBSan (dùng khi phát triển)
+make debug      # server và client với AddressSanitizer + UBSan (dùng khi kiểm thử lỗi bộ nhớ)
 make test       # chạy bộ kiểm thử tích hợp tự động 12 kịch bản
-make clean
+make clean      # xóa các binary biên dịch
+make clean-bench# xóa kết quả đo benchmark và ảnh đồ thị
 ```
 
-> Benchmark luôn phải build bằng `make` (có `-O2`, không sanitizer). Sanitizer làm số đo sai lệch.
-
-### Chạy
+### Chạy server và client
 
 ```bash
-./server                          # Unix: /tmp/chat.sock, TCP: cổng 9000, users.db, chat.log
-./server -u /tmp/x.sock -p 9100 -d users.db -l chat.log    # chỉ định từng tham số
+# Chạy server với cấu hình mặc định (Unix: /tmp/chat.sock, TCP: cổng 9000)
+./server
 
-./client -r unix                  # ĐĂNG KÝ tài khoản mới (hỏi mật khẩu 2 lần)
-./client unix                     # đăng nhập, kết nối /tmp/chat.sock
+# Chạy server với tham số tùy chỉnh
+./server -u /tmp/x.sock -p 9100 -d users.db -l chat.log
+
+# Đăng ký tài khoản mới (-r) qua Unix socket hoặc TCP
+./client -r unix                  # hỏi mật khẩu 2 lần
+./client -r tcp 127.0.0.1 9000
+
+# Đăng nhập vào phòng chat
+./client unix                     # kết nối /tmp/chat.sock
 ./client unix /tmp/x.sock
-./client tcp                      # đăng nhập qua TCP 127.0.0.1:9000
-./client -r tcp 192.168.1.10 9000
+./client tcp                      # kết nối TCP 127.0.0.1:9000
+./client tcp 192.168.1.10 9000
 ```
 
-Dừng server bằng `Ctrl+C`: server đóng toàn bộ kết nối, giải phóng bộ nhớ và `unlink` file socket.
+Dừng server bằng `Ctrl+C`: server gửi thông báo shutdown tới các client, đóng kết nối an toàn, giải phóng bộ nhớ và `unlink` file socket.
 
 ---
 
-## 6. Kịch bản demo
+## 6. Kịch bản kiểm thử tự động
 
-Dùng `tmux` hoặc mở 5 terminal.
+Dự án tích hợp sẵn kịch bản kiểm thử tự động toàn diện trong file [`src/test.sh`](src/test.sh). Để chạy kiểm thử:
+
+```bash
+make test
+```
+
+Bộ kiểm thử tự động kiểm chứng 12 trường hợp:
+1. Khởi động Server `epoll` song song Unix Domain Socket và TCP.
+2. Đăng ký tài khoản mới qua Unix Domain Socket (`/register alice`).
+3. Đăng ký tài khoản mới qua TCP Socket (`/register bob`).
+4. Ngăn chặn đăng ký trùng tên tài khoản.
+5. Kiểm tra bảo mật: Khóa và ngắt kết nối khi nhập sai mật khẩu 3 lần liên tiếp.
+6. Trò chuyện broadcast chéo giữa client Unix socket và client TCP socket trong cùng phòng.
+7. Gửi nhận tin nhắn riêng tư an toàn (`/msg`).
+8. Kiểm tra tính năng truy vấn trạng thái phiên (`/whoami`) và thống kê server (`/stats`).
+9. Đổi mật khẩu tài khoản trực tiếp (`/passwd`) và đăng nhập lại bằng mật khẩu mới.
+10. Phòng thủ giao thức: Tự động ngắt kết nối ngay khi nhận frame có độ dài giả mạo (> 4096 byte).
+11. Khả năng chịu lỗi (Fault-Tolerance): Client ngắt kết nối đột ngột, server phát hiện qua EOF và phát thông báo rời phòng mà không crash.
+12. Dừng máy chủ an toàn (Graceful Shutdown) và tự động dọn dẹp file socket trên hệ thống.
+
+---
+
+## 7. Kịch bản demo
+
+Dùng `tmux` hoặc mở 4–5 terminal.
 
 **Bước 1. Khởi động server và ba client**
 
@@ -285,126 +318,116 @@ Dùng `tmux` hoặc mở 5 terminal.
 
 Log của server hiển thị loại kết nối và danh tính đối phương, ví dụ
 `unix pid=1157 uid=1000` (lấy bằng `SO_PEERCRED`) hoặc `tcp 127.0.0.1:47956`.
-Khi gõ mật khẩu, terminal không hiện ký tự nào.
+Khi gõ mật khẩu, terminal ẩn hoàn toàn ký tự.
 
-**Bước 2. Chat**: nhắn chung, `/list`, `/msg bob xin chào`.
-Điểm cần chỉ ra: client Unix và client TCP **cùng một phòng**.
+**Bước 2. Chat và sử dụng lệnh**
 
-**Bước 2b. Tài khoản và lịch sử**
+- Nhắn tin chung: Alice và Carol trò chuyện trong cùng một phòng (dù 1 người dùng Unix socket, 1 người dùng TCP).
+- Thử gõ tin nhắn dở trên terminal client: khi có tin nhắn mới từ người khác tới, cơ chế **ANSI line management** tự động xóa dòng, in tin nhắn mới và khôi phục lại nội dung đang gõ mà không bị đè chữ.
+- Kiểm tra danh sách online: `/list`.
+- Gửi tin nhắn riêng: `/msg bob xin chào`.
+- Kiểm tra thông tin phiên: `/whoami`.
+- Xem thống kê máy chủ: `/stats`.
+- Đổi mật khẩu: `/passwd matkhau123 matkhaumoi456`.
+
+**Bước 2b. Kiểm tra tính bền bỉ của dữ liệu**
 
 ```bash
 cat users.db            # chỉ có hash ($y$...), không có mật khẩu thật
 cat chat.log            # thời gian, người gửi, nội dung; không có tin /msg
-./client unix           # thoát rồi đăng nhập lại: hiện 20 dòng lịch sử gần nhất
-./client unix           # nhập sai mật khẩu: báo lỗi chung, sai 3 lần bị ngắt
+./client unix           # thoát rồi đăng nhập lại: nhận lại 20 dòng lịch sử gần nhất
 ```
 
-Dừng server bằng `Ctrl+C`, chạy lại: tài khoản và lịch sử vẫn còn vì nằm trong file.
+Dừng server bằng `Ctrl+C`, chạy lại: tài khoản và lịch sử vẫn còn nguyên vẹn trong file.
 
-**Bước 3. Chứng minh server chịu lỗi**: trong một terminal khác chạy `kill -9 <pid của một client>`.
-Server ghi log "đóng kết nối", thông báo cho những người còn lại và **không crash**.
+**Bước 3. Chứng minh server chịu lỗi**
 
-**Bước 4. Quan sát hệ thống**
+Trong một terminal khác, chạy `kill -9 <pid của một client>`.
+Server ghi log đóng kết nối, thông báo cho những người còn lại `*** user da roi phong` và **hoạt động bình thường không crash**.
+
+**Bước 4. Quan sát hệ thống qua system call**
 
 ```bash
 ss -xlp | grep chat.sock          # socket Unix đang lắng nghe
 ss -tlnp | grep 9000              # socket TCP đang lắng nghe
-ss -xp | grep chat.sock           # các kết nối Unix đang mở
 sudo strace -p "$(pgrep -x server)" -e trace=epoll_wait,accept4,read,sendto,epoll_ctl
 ```
 
-Với `strace` có thể chỉ ra từng lời gọi: `epoll_wait` trả về sự kiện, `accept4` nhận kết nối mới,
-`read` lấy dữ liệu, `sendto` (chính là `send`) phát lại cho mọi client.
-
-**Bước 5. Kiểm tra giao thức tự thiết kế**
+**Bước 5. Kiểm tra phòng thủ giao thức tự thiết kế**
 
 ```bash
-# Gửi văn bản thô, không có tiền tố độ dài: server từ chối và ngắt kết nối
+# Gửi văn bản thô, không có tiền tố độ dài: server từ chối và ngắt kết nối ngay
 echo "hello" | socat - UNIX-CONNECT:/tmp/chat.sock
 
 # Gửi đúng một frame (4 byte độ dài = 5, rồi "hello")
 printf '\x00\x00\x00\x05hello' | socat -t1 - UNIX-CONNECT:/tmp/chat.sock
 ```
 
-Lần đầu `socat` bị ngắt vì 4 byte đầu `hell` được đọc thành một độ dài khổng lồ (vượt 4096),
-log server ghi "frame không hợp lệ". Lần thứ hai là frame hợp lệ nên được chấp nhận ở tầng giao thức,
-nhưng vì chưa đăng nhập nên server trả `-ERR Chua dang nhap...`.
-Điều này minh họa vì sao cần framing, vì sao phải kiểm tra độ dài, và rằng xác thực là một lớp riêng.
-
-**Bước 6. Benchmark**: chiếu biểu đồ độ trễ và thông lượng (xem mục sau).
-
 ---
 
-## 7. Benchmark
+## 8. Benchmark hiệu năng IPC
+
+Chương trình đo lường định lượng và so sánh cả 6 cơ chế giao tiếp liên tiến trình:
+`pipe`, `unix_stream`, `unix_dgram`, `unix_seqp`, `tcp` và `shm` (POSIX Shared Memory).
 
 ```bash
 make
 ./bench > results.csv                 # khoảng 30 giây, tiến độ in ra stderr
+./bench -q                            # chế độ nhanh (dưới 2 giây)
 python3 plot.py results.csv           # tạo latency.png và throughput.png
 ```
 
 | Tuỳ chọn | Ý nghĩa |
 |---|---|
 | `-m <cơ chế>` | Chỉ chạy cơ chế này, có thể lặp lại: `pipe`, `unix_stream`, `unix_dgram`, `unix_seqp`, `tcp`, `shm` |
-| `-a <cpu>` `-b <cpu>` | Ghim tiến trình cha và con vào CPU (mặc định 0 và 1) |
+| `-a <cpu>` `-b <cpu>` | Ghim tiến trình cha và con vào CPU qua `sched_setaffinity` (mặc định 0 và 1) |
 | `-n` | Không ghim CPU |
-| `-q` | Chế độ nhanh, ít vòng lặp, dùng để thử |
+| `-q` | Chế độ nhanh (quick mode, ít vòng lặp hơn) |
 
-**Cách đo**
+**Phương pháp đo**
 
-- **Độ trễ**: ping-pong, cha gửi `S` byte, con gửi lại `S` byte. Đo RTT bằng `clock_gettime(CLOCK_MONOTONIC)`, bỏ 2000 vòng warm-up, báo cáo **nửa RTT** (trung bình, p50, p99). Kích thước `S` gồm 64 B, 1 KiB, 4 KiB, 16 KiB, 64 KiB.
-- **Thông lượng**: cha gửi liên tục một chiều, con đọc hết rồi trả ack 1 byte. Thời gian tính từ lúc bắt đầu gửi đến lúc nhận ack. Đơn vị MB/s với 1 MB = 10^6 byte.
-- Kênh dựng bằng `pipe()`, `socketpair()` và (với TCP) `bind`/`listen`/`connect`/`accept` trên `127.0.0.1`, đặt `TCP_NODELAY`.
-- Hai tiến trình được ghim CPU để giảm nhiễu từ bộ lập lịch. Hãy thử cả hai cấu hình `-a 0 -b 0` (cùng core) và `-a 0 -b 1` (khác core): chúng cho kết quả khác nhau và đáng đưa vào phần phân tích.
-
-**Khi chạy để lấy số cho báo cáo**: đóng chương trình nặng, cắm điện nếu là laptop, chạy ít nhất 3 lần và lấy kết quả ổn định.
-Môi trường máy ảo thường cho số nhiễu và không phản ánh phần cứng thật.
+- **Độ trễ**: Đo theo mô hình ping-pong (cha gửi `S` byte, con echo lại `S` byte). Đo RTT bằng `clock_gettime(CLOCK_MONOTONIC)`, bỏ vòng warm-up, báo cáo **nửa RTT ($RTT/2$)** với các phân vị trung bình, p50 và p99. Kích thước `S`: 64 B, 1 KiB, 4 KiB, 16 KiB, 64 KiB.
+- **Thông lượng**: Cha gửi liên tục một chiều, con đọc hết. Thời gian tính từ lúc bắt đầu gửi đến khi hoàn tất. Đơn vị MB/s ($10^6\text{ byte/s}$).
+- **Shared Memory**: Dùng `shm_open`, `ftruncate`, `mmap(MAP_SHARED)` và đồng bộ bằng POSIX Unnamed Semaphore (`sem_wait` / `sem_post`).
+- Hai tiến trình được ghim CPU để giảm thiểu nhiễu từ bộ lập lịch kernel.
 
 ---
 
-## 8. Ghi chú thiết kế
+## 9. Ghi chú thiết kế hệ thống
 
-1. **Buffer đọc riêng cho từng client** (`rbuf`, `rlen`). Một `read()` có thể ra nửa frame hoặc nhiều frame. `on_readable()` tách mọi frame đã đủ rồi `memmove` phần dư về đầu buffer.
-2. **Buffer ghi riêng cho từng client** (`wbuf`, `woff`, `wlen`). Khi `send()` trả `EAGAIN`, phần chưa gửi được giữ lại và server đăng ký thêm `EPOLLOUT`; khi socket ghi được thì `flush_client()` gửi tiếp. Nếu hàng đợi của một client vượt 1 MiB (đọc quá chậm), server ngắt client đó để không phình bộ nhớ.
-3. **Giải phóng client và phát thông báo an toàn (khử reentrancy).** `kill_client()` chỉ đóng fd, đánh dấu `dead` và bật cờ `need_leave_notify`. Việc phát thông báo rời phòng `*** user da roi phong` và giải phóng bộ nhớ được dời về `sweep_dead()` ở cuối vòng lặp. Cách này loại bỏ hoàn toàn nguy cơ đệ quy (reentrancy hazard) khi một client bị ngắt trong lúc server đang lặp broadcast tới các client khác.
-4. **`struct handle` đứng đầu mọi đối tượng trong epoll**, nên `data.ptr` đủ để phân biệt listener Unix, listener TCP và client.
-5. **Level-triggered**, mỗi sự kiện chỉ `read()` một lượt cho mỗi client. Cách này đơn giản và công bằng giữa các client. Nếu chuyển sang edge-triggered thì bắt buộc phải đọc đến khi gặp `EAGAIN`.
-6. **Chi tiết hệ thống**: `accept4` với `SOCK_NONBLOCK | SOCK_CLOEXEC`; `MSG_NOSIGNAL` cùng bỏ qua `SIGPIPE`; `SO_REUSEADDR` cho cổng TCP; `unlink` file socket cũ trước khi `bind` và khi thoát; kiểm tra độ dài `sun_path`; `TCP_NODELAY`; `SO_PEERCRED` để ghi PID/UID của client Unix; `SIGINT`/`SIGTERM` đặt cờ dừng (không dùng `SA_RESTART` để `epoll_wait` trả về `EINTR`).
-7. **Client và ANSI Line Management.** Client dùng `poll()` trên stdin và socket, đọc stdin bằng `read()` chứ không dùng stdio. Đồng thời tích hợp cơ chế điều khiển ANSI (`\r\033[K`) để khi có tin nhắn mới từ phòng chat gửi đến không đè lên dòng văn bản người dùng đang nhập dở.
-8. **Lưu mật khẩu.** Server không bao giờ lưu mật khẩu thô: `make_hash()` sinh salt ngẫu nhiên bằng `getrandom` rồi băm bằng `crypt_r` (yescrypt, chi phí tính toán cao để chống dò mật khẩu hàng loạt khi file bị lộ). `verify_pass()` so khớp bằng phép so sánh thời gian cố định. Với tên không tồn tại, server vẫn tính một lần `crypt` với hash giả để thời gian phản hồi không tiết lộ tên nào có thật.
-9. **Trạng thái đăng nhập từng client** (`authed`, `auth_fails`, `connected_at`). Client chưa đăng nhập không nhận broadcast, không có trong `/list`, và bị ngắt sau 3 lần sai hoặc sau 30 giây im lặng. `epoll_wait` dùng timeout 1 giây để định kỳ dọn các kết nối này.
-10. **Dọn dấu vết mật khẩu trong bộ nhớ.** Sau khi xử lý mỗi frame, server `explicit_bzero` bản sao tin nhắn và vùng đã dùng của `rbuf`; client xóa mật khẩu khỏi bộ nhớ ngay sau khi gửi. Mật khẩu không bao giờ được ghi vào log hay `chat.log`.
-11. **Lịch sử.** `chat.log` được mở `O_APPEND` và mỗi dòng ghi bằng đúng một lần `write()`, nên mỗi dòng được nối vào cuối file nguyên vẹn. Khi đăng nhập, server chỉ `pread` 32 KiB cuối file rồi lấy 20 dòng cuối, nên thời gian không tăng theo kích thước lịch sử.
-12. **Tài khoản mới** được ghi vào `users.db` bằng một lần `write()` kèm `fsync()` trước khi thêm vào bảng trong bộ nhớ, nên server dừng đột ngột cũng không mất tài khoản vừa tạo.
-
----
-
-## 9. Hạn chế
-
-- Chỉ có một luồng: một `handle_message` chậm sẽ làm chậm tất cả. Với quy mô đồ án thì không ảnh hưởng.
-- **Không có mã hóa (TLS).** Mật khẩu đi qua socket dưới dạng văn bản thô. Với Unix socket thì chỉ các tiến trình cùng máy thấy được; với TCP, ai nghe được đường truyền sẽ thấy cả mật khẩu và tin nhắn. Chỉ nên dùng TCP trong mạng tin cậy hoặc qua tunnel (SSH, WireGuard); hướng phát triển là thêm TLS (OpenSSL).
-- Mỗi lần kiểm tra mật khẩu tốn khoảng 10 đến 15 ms CPU (yescrypt mặc định) và chạy ngay trong vòng lặp `epoll`, nên một client liên tục đoán mật khẩu làm chậm cả server. Server mới giới hạn 3 lần sai mỗi kết nối, chưa giới hạn theo địa chỉ IP.
-- Chưa có đổi mật khẩu, xóa tài khoản, phân quyền (admin) hay giới hạn dung lượng `chat.log` (file chỉ lớn dần).
-- Bảng tài khoản nằm trong RAM và tra cứu tuần tự, phù hợp vài trăm đến vài nghìn tài khoản.
-- Server chỉ lắng nghe IPv4. Client dùng `getaddrinfo` nên kết nối được IPv4 hoặc IPv6 nếu server hỗ trợ.
-- File socket được `chmod 0666`, tức mọi user trên máy đều kết nối được. Phù hợp để demo, không phù hợp cho môi trường nhiều người dùng.
-- Benchmark dùng `socketpair`, không phải `bind` vào file `.sock`. Đường dữ liệu trong kernel giống nhau nên số đo không đổi, chỉ khác cách dựng kênh.
+1. **Module hóa giao thức (`proto.h` / `proto.c`)**: Tách biệt tầng đóng gói framing, kiểm tra độ dài big-endian và các hàm I/O an toàn (`write_full`, `read_exact`, `pack_frame`) dùng chung cho cả server và client.
+2. **Buffer đọc riêng từng client (`rbuf`, `rlen`)**: Tách mọi frame hoàn chỉnh trong một lần đọc rồi `memmove` phần dư về đầu buffer.
+3. **Buffer ghi riêng từng client (`wbuf`, `woff`, `wlen`)**: Khi `send()` trả về `EAGAIN`, phần chưa gửi được giữ lại trong hàng đợi và server đăng ký thêm `EPOLLOUT`. Nếu hàng đợi vượt quá 1 MiB (`WBUF_LIMIT`), server lập tức ngắt client đọc quá chậm để chống cạn kiệt bộ nhớ.
+4. **Khử nguy cơ đệ quy (Reentrancy Hazard)**: `kill_client()` đóng fd, đánh dấu `dead = 1` và cờ `need_leave_notify`. Việc phát thông báo `*** user da roi phong` và giải phóng bộ nhớ thực sự được dời về `sweep_dead()` ở cuối vòng lặp. Điều này loại bỏ hoàn toàn nguy cơ đệ quy lồng nhau khi client bị ngắt trong lúc server đang lặp broadcast.
+5. **Cấu trúc đa hình `struct handle`**: Nằm ở đầu mọi đối tượng đăng ký trong epoll, giúp con trỏ `epoll_event.data.ptr` phân biệt ngay listener Unix, listener TCP và client.
+6. **Chống đè dòng chat ở Client (ANSI Line Management)**: Client dùng `poll()` trên stdin và socket. Khi có tin nhắn đến từ server, client dùng mã ANSI `\r\033[K` để xóa dòng hiện tại, in tin nhắn mới, rồi in lại prompt `> ` kèm nội dung đang gõ dở.
+7. **Lưu mật khẩu bảo mật cao**: Mật khẩu thô không bao giờ nằm trong file hay bộ nhớ. Dùng `getrandom` sinh salt ngẫu nhiên, băm bằng `crypt_r` (yescrypt) và so khớp thời gian cố định (chống timing attack bằng cả dummy hash khi user không tồn tại).
+8. **Đổi mật khẩu an toàn (`/passwd`)**: Cập nhật file `users.db` qua cơ chế ghi nguyên tử (atomic write qua file tạm `users.db.tmp` + `rename`) để đảm bảo database không bị hỏng nếu server dừng đột ngột.
+9. **Dual-Stack IPv6 / IPv4**: Socket TCP mở `AF_INET6` với `IPV6_V6ONLY = 0`, phục vụ đồng thời cả kết nối IPv4 và IPv6 trên cùng một cổng (tự động fallback về IPv4 nếu kernel không có IPv6).
+10. **Graceful Shutdown**: Server bắt tín hiệu `SIGINT`/`SIGTERM`, gửi thông báo shutdown tới toàn bộ client, flush sạch hàng đợi ghi trước khi đóng kết nối và `unlink` file socket.
+11. **Lịch sử hội thoại append-only**: `chat.log` ghi bằng `write()` nguyên tử trên fd `O_APPEND`. Khi đăng nhập, server chỉ `pread` 32 KiB cuối file lấy 20 dòng gần nhất, thời gian xử lý không tăng theo dung lượng file.
 
 ---
 
-## 10. Xử lý sự cố
+## 10. Hạn chế và Hướng phát triển
+
+- **Đơn luồng**: Xử lý `crypt_r` tốn 10–15 ms CPU chạy trực tiếp trong event loop có thể làm trễ tạm thời các kết nối khác nếu bị tấn công dò mật khẩu liên tục. Hướng phát triển: Chuyển tác vụ băm mật khẩu sang **Worker Thread Pool** (`pthread`).
+- **Chưa có mã hóa truyền tải (TLS)**: Mật khẩu và nội dung truyền qua TCP dưới dạng plaintext. Hướng phát triển: Tích hợp thư viện **OpenSSL** (TLS v1.3).
+- **Phân quyền socket Unix**: Socket Unix hiện được `chmod 0666` để thuận tiện demo. Trong môi trường production nhiều người dùng, nên đặt quyền `0660` theo nhóm (GID) và kiểm tra UID đối phương qua `SO_PEERCRED`.
+- **Dung lượng `chat.log`**: File log hiện tại chỉ ghi thêm, chưa có cơ chế log rotation (cắt file theo dung lượng hoặc theo ngày).
+
+---
+
+## 11. Xử lý sự cố
 
 | Triệu chứng | Nguyên nhân và cách xử lý |
 |---|---|
-| `undefined reference to 'main'` khi build | File `.c` rỗng hoặc thiếu hàm `main` (chưa lưu hoặc chép thiếu). Kiểm tra `wc -l` và `grep -n "int main"` |
-| `bind(tcp): Address already in use` | Cổng đang bị tiến trình khác dùng. Tìm bằng `ss -tlnp \| grep 9000`, hoặc chạy `./server /tmp/chat.sock 9100` |
-| Client báo `connect(unix): No such file or directory` | Server chưa chạy hoặc khác đường dẫn socket |
-| Client báo `connect(unix): Connection refused` | File socket còn sót nhưng không có tiến trình lắng nghe. Chạy lại server (server tự `unlink` file cũ) |
-| Dùng `nc` hoặc `socat` gõ chữ thô thì bị ngắt | Đúng thiết kế: giao thức yêu cầu tiền tố độ dài 4 byte. Dùng `./client`, hoặc xem bước 5 ở mục demo |
-| `fatal error: crypt.h: No such file or directory` hoặc `cannot find -lcrypt` | Thiếu `libxcrypt`: `sudo pacman -S libxcrypt` |
-| Client báo `Loi: Sai ten dang nhap hoac mat khau` | Sai tên hoặc mật khẩu, hoặc tài khoản chưa có (chạy `./client -r ...` để đăng ký). Sai 3 lần thì bị ngắt, chạy lại client |
-| Client báo `Ten dang nhap da ton tai` khi đăng ký | Tên đã có trong `users.db`, chọn tên khác |
-| Client báo `Tai khoan dang duoc dung o noi khac` | Tài khoản đang đăng nhập ở một client khác; thoát client đó trước |
-| Quên mật khẩu | Chưa có chức năng đặt lại. Dừng server, xóa dòng của tài khoản trong `users.db`, chạy lại server rồi đăng ký lại tên đó (bảng tài khoản chỉ được nạp lúc khởi động) |
-| Server in `canh bao: users.db co quyen 0644` | File cũ có quyền rộng hơn; server tự đặt lại `0600`, không cần làm gì thêm |
-| Số benchmark nhảy lung tung | Máy ảo, máy đang tải, hoặc chạy bản có sanitizer. Build lại bằng `make` và chạy lúc máy rảnh |
+| `bind(tcp): Address already in use` | Cổng đang bị tiến trình khác dùng. Tìm bằng `ss -tlnp \| grep 9000`, hoặc chạy `./server -p 9100` |
+| Client báo `connect(unix): No such file or directory` | Server chưa chạy hoặc khác đường dẫn socket. Chạy server trước |
+| Client báo `connect(unix): Connection refused` | File socket cũ còn sót nhưng không có tiến trình lắng nghe. Chạy lại server (server tự động `unlink` file cũ) |
+| Dùng `nc` hoặc `socat` gõ chữ thô thì bị ngắt | Đúng thiết kế: giao thức yêu cầu tiền tố độ dài 4 byte. Dùng `./client` |
+| `fatal error: crypt.h: No such file or directory` hoặc `cannot find -lcrypt` | Thiếu thư viện băm: trên Arch chạy `sudo pacman -S libxcrypt`; trên Ubuntu/Debian chạy `sudo apt-get install libcrypt-dev` |
+| Client báo `Loi: Sai ten dang nhap hoac mat khau` | Nhập sai thông tin hoặc chưa có tài khoản. Chạy `./client -r ...` để đăng ký |
+| Client báo `Ten dang nhap da ton tai` khi đăng ký | Tên đã có trong `users.db`, chọn tên đăng nhập khác |
+| Client báo `Tai khoan dang duoc dung o noi khac` | Tài khoản đang được đăng nhập ở một client khác; thoát client đó trước |
+| Quên mật khẩu | Dừng server, xóa dòng tương ứng trong `users.db`, khởi động lại server và đăng ký lại |
