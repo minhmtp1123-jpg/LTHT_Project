@@ -14,13 +14,14 @@ matplotlib.use("Agg")           # khong can man hinh
 import matplotlib.pyplot as plt
 from matplotlib.ticker import ScalarFormatter
 
-ORDER = ["pipe", "unix_stream", "unix_seqp", "unix_dgram", "tcp"]
+ORDER = ["pipe", "unix_stream", "unix_seqp", "unix_dgram", "tcp", "shm"]
 STYLE = {                        # mau + marker khac nhau de in den-trang van doc duoc
     "pipe":        ("#1b9e77", "o"),
     "unix_stream": ("#d95f02", "s"),
     "unix_seqp":   ("#7570b3", "^"),
     "unix_dgram":  ("#e7298a", "D"),
     "tcp":         ("#386cb0", "v"),
+    "shm":         ("#e6ab02", "P"),
 }
 
 

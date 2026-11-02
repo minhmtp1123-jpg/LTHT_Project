@@ -179,6 +179,7 @@ Chương trình [`bench.c`](../src/bench.c) so sánh định lượng độ tr�
 3. `unix_dgram`: Cặp socket Unix Domain dạng datagram (`SOCK_DGRAM`).
 4. `unix_seqp`: Cặp socket Unix Domain dạng sequential packet (`SOCK_SEQPACKET`).
 5. `tcp`: Socket TCP Loopback (`127.0.0.1`), cổng cấp động, kích hoạt `TCP_NODELAY`.
+6. `shm`: POSIX Shared Memory (`shm_open` + `mmap` + Semaphore POSIX `sem_init`/`sem_wait`).
 
 ### Phương pháp đo
 
@@ -235,7 +236,7 @@ Dưới đây là bảng số liệu đo thực tế từ [`src/results.csv`](..
 | **Quyền socket Unix mặc định `0666`** | Mọi user nội bộ đều có thể connect tới `/tmp/chat.sock` | Đặt quyền `0660` theo nhóm định danh (GID) và kiểm tra UID qua `SO_PEERCRED` |
 | **Server chỉ lắng nghe IPv4** | Socket TCP khởi tạo bằng `AF_INET` | Nâng cấp socket TCP lên `AF_INET6` kèm cấu hình `IPV6_V6ONLY = 0` (Dual-Stack IPv4/IPv6) |
 | **Chưa có lệnh đổi mật khẩu** | Mật khẩu chỉ được thiết lập một lần lúc đăng ký | Bổ sung lệnh `/passwd <cũ> <mới>` cho phép client tự cập nhật hash trong `users.db` |
-| **Benchmark chưa có Shared Memory** | Chỉ mới đo lường Socket và Pipe | Bổ sung **POSIX Shared Memory (`shm_open`, `mmap`, `sem_wait`)** để hoàn thiện bộ so sánh IPC |
+| **Shared Memory (Zero-Copy IPC)** | Đã tích hợp thành công vào `bench.c` | Đo lường hiệu năng đỉnh cao của Shared Memory + Semaphore so sánh trực tiếp với Socket |
 
 ---
 

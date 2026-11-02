@@ -6,19 +6,20 @@
  *   unix_dgram  : AF_UNIX, SOCK_DGRAM
  *   unix_seqp   : AF_UNIX, SOCK_SEQPACKET
  *   tcp         : TCP qua loopback 127.0.0.1
+ *   shm         : POSIX Shared Memory (shm_open + mmap + POSIX Semaphore)
  *
- * Moi cap (co che, kich thuoc) do 2 thu:
+ * Moi cap (co che, kich thuoc) do 2 chi so:
  *   1. Do tre: ping-pong (cha gui S byte, con gui tra S byte), do RTT bang
  *      clock_gettime(CLOCK_MONOTONIC); bo qua cac vong warm-up; bao cao
  *      do tre mot chieu = RTT/2 (trung binh, p50, p99).
- *   2. Thong luong: cha gui lien tuc N goi S byte, con doc het roi gui 1 byte
- *      ack; thoi gian tinh tu luc bat dau gui den luc nhan ack.
+ *   2. Thong luong: cha gui lien tuc N goi S byte, con doc het;
+ *      thoi gian tinh tu luc bat dau gui den luc hoan thanh.
  *
  * Ket qua in ra stdout dang CSV; tien do in ra stderr.
  *
- * Build:  gcc -Wall -Wextra -O2 -o bench bench.c
+ * Build:  gcc -Wall -Wextra -O2 -o bench bench.c -pthread -lrt
  * Chay:   ./bench > results.csv
- *         ./bench -m tcp -m pipe -a 0 -b 1 > results.csv
+ *         ./bench -m tcp -m shm -a 0 -b 1 > results.csv
  * Tuy chon:
  *   -m <co che>   chi chay co che nay (lap lai duoc); mac dinh: tat ca
  *   -a <cpu>      ghim tien trinh cha vao CPU nay      (mac dinh 0)
@@ -29,23 +30,27 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sched.h>
+#include <semaphore.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
-enum mech { M_PIPE, M_USTREAM, M_UDGRAM, M_USEQP, M_TCP, M_COUNT };
+enum mech { M_PIPE, M_USTREAM, M_UDGRAM, M_USEQP, M_TCP, M_SHM, M_COUNT };
 
 static const char *mech_name[M_COUNT] = {
-    "pipe", "unix_stream", "unix_dgram", "unix_seqp", "tcp"
+    "pipe", "unix_stream", "unix_dgram", "unix_seqp", "tcp", "shm"
 };
 
 static const size_t sizes[] = { 64, 1024, 4096, 16384, 65536 };
@@ -56,6 +61,15 @@ static const size_t sizes[] = { 64, 1024, 4096, 16384, 65536 };
 static int g_quick = 0;
 
 struct ep { int rd, wr; };   /* dau doc / dau ghi cua mot tien trinh */
+
+/* Cau truc vung bo nho chia se POSIX Shared Memory */
+struct shm_area {
+    sem_t sem_p2c;           /* Cha bao cho con */
+    sem_t sem_c2p;           /* Con bao cho cha */
+    char data[65536];        /* Vung dem truyen du lieu (toi da 64 KiB) */
+};
+
+static struct shm_area *g_shm = NULL;
 
 /* ------------------------------------------------------------------ */
 
@@ -72,7 +86,7 @@ static double now_us(void)
     return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
 }
 
-static int is_stream(int m)  /* co ranh gioi tin nhan hay khong */
+static int is_stream(int m)
 {
     return m == M_PIPE || m == M_USTREAM || m == M_TCP;
 }
@@ -124,7 +138,6 @@ static void read_full(int fd, char *buf, size_t n)
     }
 }
 
-/* Nhan dung 1 "tin nhan" S byte, bat ke stream hay datagram */
 static void recv_msg(int m, int fd, char *buf, size_t s)
 {
     if (is_stream(m)) {
@@ -157,7 +170,7 @@ static void setup_tcp(struct ep *par, struct ep *chi)
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    a.sin_port = 0;                           /* he dieu hanh chon port */
+    a.sin_port = 0;
     if (bind(ls, (struct sockaddr *)&a, sizeof a) < 0)
         die("bind");
     if (listen(ls, 1) < 0)
@@ -176,12 +189,31 @@ static void setup_tcp(struct ep *par, struct ep *chi)
         die("accept");
     close(ls);
 
-    int one = 1;                              /* tat Nagle: do dung do tre */
+    int one = 1;
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 
     par->rd = par->wr = c;
     chi->rd = chi->wr = s;
+}
+
+static void setup_shm(void)
+{
+    int fd = shm_open("/ltht_bench_shm", O_CREAT | O_RDWR, 0600);
+    if (fd < 0)
+        die("shm_open");
+    if (ftruncate(fd, sizeof(struct shm_area)) < 0)
+        die("ftruncate");
+    g_shm = mmap(NULL, sizeof(struct shm_area), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (g_shm == MAP_FAILED)
+        die("mmap");
+    shm_unlink("/ltht_bench_shm");
+    close(fd);
+
+    if (sem_init(&g_shm->sem_p2c, 1, 0) < 0)
+        die("sem_init p2c");
+    if (sem_init(&g_shm->sem_c2p, 1, 0) < 0)
+        die("sem_init c2p");
 }
 
 static void setup(int m, struct ep *par, struct ep *chi)
@@ -217,6 +249,9 @@ static void setup(int m, struct ep *par, struct ep *chi)
     case M_TCP:
         setup_tcp(par, chi);
         break;
+    case M_SHM:
+        setup_shm();
+        break;
     }
 }
 
@@ -229,6 +264,30 @@ static void child_main(int m, struct ep e, size_t s, int lat_total, long thr_n)
     char *buf = malloc(SINK_BUF);
     if (!buf)
         die("malloc");
+
+    if (m == M_SHM) {
+        /* Pha 1: echo do tre */
+        for (int i = 0; i < lat_total; i++) {
+            while (sem_wait(&g_shm->sem_p2c) < 0) {
+                if (errno == EINTR) continue;
+                die("sem_wait");
+            }
+            memcpy(buf, g_shm->data, s);
+            memcpy(g_shm->data, buf, s);
+            sem_post(&g_shm->sem_c2p);
+        }
+        /* Pha 2: sink thong luong */
+        for (long i = 0; i < thr_n; i++) {
+            while (sem_wait(&g_shm->sem_p2c) < 0) {
+                if (errno == EINTR) continue;
+                die("sem_wait");
+            }
+            memcpy(buf, g_shm->data, s);
+            sem_post(&g_shm->sem_c2p);
+        }
+        free(buf);
+        return;
+    }
 
     /* pha 1: echo */
     for (int i = 0; i < lat_total; i++) {
@@ -275,14 +334,14 @@ static void run_one(int m, size_t s, int cpu_a, int cpu_b)
     int warm = g_quick ? 100 : 2000;
     int iters = g_quick ? 1000 : (s <= 4096 ? 20000 : 5000);
     long thr_n = 128L * 1024 * 1024 / (long)s;
-    if (thr_n > 300000)
-        thr_n = 300000;
+    if (thr_n > 100000)
+        thr_n = 100000;
     if (g_quick)
         thr_n /= 20;
     if (thr_n < 100)
         thr_n = 100;
 
-    struct ep par, chi;
+    struct ep par = { -1, -1 }, chi = { -1, -1 };
     setup(m, &par, &chi);
 
     fflush(NULL);
@@ -291,16 +350,20 @@ static void run_one(int m, size_t s, int cpu_a, int cpu_b)
         die("fork");
     if (pid == 0) {
         pin_cpu(cpu_b);
-        close(par.rd);
-        if (par.wr != par.rd)
-            close(par.wr);
+        if (m != M_SHM) {
+            close(par.rd);
+            if (par.wr != par.rd)
+                close(par.wr);
+        }
         child_main(m, chi, s, warm + iters, thr_n);
         _exit(EXIT_SUCCESS);
     }
     pin_cpu(cpu_a);
-    close(chi.rd);
-    if (chi.wr != chi.rd)
-        close(chi.wr);
+    if (m != M_SHM) {
+        close(chi.rd);
+        if (chi.wr != chi.rd)
+            close(chi.wr);
+    }
 
     char *buf = malloc(s > 1 ? s : 1);
     double *rtt = malloc(sizeof(double) * (size_t)iters);
@@ -308,7 +371,59 @@ static void run_one(int m, size_t s, int cpu_a, int cpu_b)
         die("malloc");
     memset(buf, 0x5a, s);
 
-    /* --- do tre --- */
+    if (m == M_SHM) {
+        /* --- do tre SHM --- */
+        for (int i = 0; i < warm + iters; i++) {
+            double t0 = now_us();
+            memcpy(g_shm->data, buf, s);
+            sem_post(&g_shm->sem_p2c);
+            while (sem_wait(&g_shm->sem_c2p) < 0) {
+                if (errno == EINTR) continue;
+                die("sem_wait");
+            }
+            memcpy(buf, g_shm->data, s);
+            double t1 = now_us();
+            if (i >= warm)
+                rtt[i - warm] = t1 - t0;
+        }
+        double sum = 0;
+        for (int i = 0; i < iters; i++)
+            sum += rtt[i];
+        qsort(rtt, (size_t)iters, sizeof(double), cmp_d);
+        double mean = sum / iters / 2.0;
+        double p50  = rtt[iters / 2] / 2.0;
+        double p99  = rtt[(int)(iters * 0.99)] / 2.0;
+
+        /* --- thong luong SHM --- */
+        double t0 = now_us();
+        for (long i = 0; i < thr_n; i++) {
+            memcpy(g_shm->data, buf, s);
+            sem_post(&g_shm->sem_p2c);
+            while (sem_wait(&g_shm->sem_c2p) < 0) {
+                if (errno == EINTR) continue;
+                die("sem_wait");
+            }
+        }
+        double t1 = now_us();
+        double mbps = ((double)thr_n * (double)s) / (t1 - t0);
+
+        printf("%s,%zu,%.3f,%.3f,%.3f,%.1f\n",
+               mech_name[m], s, mean, p50, p99, mbps);
+        fflush(stdout);
+
+        sem_destroy(&g_shm->sem_p2c);
+        sem_destroy(&g_shm->sem_c2p);
+        munmap(g_shm, sizeof(struct shm_area));
+        g_shm = NULL;
+        free(buf);
+        free(rtt);
+
+        int st;
+        waitpid(pid, &st, 0);
+        return;
+    }
+
+    /* --- do tre Socket / Pipe --- */
     for (int i = 0; i < warm + iters; i++) {
         double t0 = now_us();
         write_full(par.wr, buf, s);
@@ -325,14 +440,14 @@ static void run_one(int m, size_t s, int cpu_a, int cpu_b)
     double p50  = rtt[iters / 2] / 2.0;
     double p99  = rtt[(int)(iters * 0.99)] / 2.0;
 
-    /* --- thong luong --- */
+    /* --- thong luong Socket / Pipe --- */
     double t0 = now_us();
     for (long i = 0; i < thr_n; i++)
         write_full(par.wr, buf, s);
     char ack;
     read_full(par.rd, &ack, 1);
     double t1 = now_us();
-    double mbps = ((double)thr_n * (double)s) / (t1 - t0);  /* byte/us = MB/s */
+    double mbps = ((double)thr_n * (double)s) / (t1 - t0);
 
     printf("%s,%zu,%.3f,%.3f,%.3f,%.1f\n",
            mech_name[m], s, mean, p50, p99, mbps);

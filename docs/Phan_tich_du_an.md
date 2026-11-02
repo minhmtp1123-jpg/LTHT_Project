@@ -99,6 +99,7 @@ Tên hiển thị được cố định theo tên đăng nhập (chỉ gồm ch�
 | `unix_dgram` | `socketpair(AF_UNIX, SOCK_DGRAM)` |
 | `unix_seqp` | `socketpair(AF_UNIX, SOCK_SEQPACKET)` |
 | `tcp` | TCP loopback trên `127.0.0.1`, cổng được hệ điều hành cấp động |
+| `shm` | POSIX Shared Memory (`shm_open` + `mmap` + POSIX Semaphore) |
 
 Kích thước thông điệp được thử là 64 B, 1 KiB, 4 KiB, 16 KiB và 64 KiB.
 
@@ -114,6 +115,7 @@ Các lệnh dưới đây chạy từ thư mục `src/`:
 ```bash
 make                 # build server, client và bench với -O2
 make debug           # build server/client với AddressSanitizer và UBSan
+make test            # chạy bộ kiểm thử tích hợp tự động 12 kịch bản
 ./server             # Unix /tmp/chat.sock và TCP cổng 9000
 ./client -r unix     # đăng ký tài khoản mới qua Unix socket
 ./client unix        # đăng nhập qua Unix socket
@@ -138,6 +140,7 @@ Server nhận các tham số tùy chọn:
 | [`src/client.c`](../src/client.c) | Kết nối Unix/TCP, xác thực an toàn (ẩn mật khẩu), poll stdin/socket, framing và giao diện dòng lệnh |
 | [`src/bench.c`](../src/bench.c) | Dựng các kênh IPC, fork tiến trình đo, tính thống kê độ trễ/thông lượng và xuất CSV |
 | [`src/plot.py`](../src/plot.py) | Đọc CSV và vẽ biểu đồ phân phối độ trễ và thông lượng |
+| [`src/test.sh`](../src/test.sh) | Kịch bản kiểm thử tích hợp tự động toàn bộ tính năng và edge cases |
 | [`src/Makefile`](../src/Makefile) | Các target build, debug, benchmark, plot và clean |
 | [`README.md`](../README.md) | Hướng dẫn tổng quan, demo, benchmark và ghi chú thiết kế |
 | [`docs/BaoCao.md`](./BaoCao.md) | Báo cáo đồ án chi tiết và phân tích số liệu đo lường |

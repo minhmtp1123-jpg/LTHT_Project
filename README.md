@@ -247,6 +247,7 @@ nếu thiếu `crypt.h` khi build thì cài `libxcrypt`.
 ```bash
 make            # bản -O2, không sanitizer (dùng cho demo và benchmark)
 make debug      # server và client với ASan + UBSan (dùng khi phát triển)
+make test       # chạy bộ kiểm thử tích hợp tự động 12 kịch bản
 make clean
 ```
 
@@ -344,7 +345,7 @@ python3 plot.py results.csv           # tạo latency.png và throughput.png
 
 | Tuỳ chọn | Ý nghĩa |
 |---|---|
-| `-m <cơ chế>` | Chỉ chạy cơ chế này, có thể lặp lại: `pipe`, `unix_stream`, `unix_dgram`, `unix_seqp`, `tcp` |
+| `-m <cơ chế>` | Chỉ chạy cơ chế này, có thể lặp lại: `pipe`, `unix_stream`, `unix_dgram`, `unix_seqp`, `tcp`, `shm` |
 | `-a <cpu>` `-b <cpu>` | Ghim tiến trình cha và con vào CPU (mặc định 0 và 1) |
 | `-n` | Không ghim CPU |
 | `-q` | Chế độ nhanh, ít vòng lặp, dùng để thử |

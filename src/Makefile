@@ -3,7 +3,7 @@ WARN    := -Wall -Wextra
 OPT     := -O2 -g
 SAN     := -fsanitize=address,undefined
 
-.PHONY: all debug bench-run plot clean clean-bench distclean
+.PHONY: all debug test bench-run plot clean clean-bench distclean
 
 # Ban phat hanh (dung -O2, khong sanitizer). Benchmark LUON build kieu nay.
 all: server client bench
@@ -15,12 +15,15 @@ client: client.c proto.c proto.h
 	$(CC) $(WARN) $(OPT) -o $@ client.c proto.c
 
 bench: bench.c
-	$(CC) $(WARN) $(OPT) -o $@ $<
+	$(CC) $(WARN) $(OPT) -o $@ $< -pthread -lrt
 
 # Ban debug cho server/client (ASan + UBSan) de phat hien loi bo nho
 debug:
 	$(CC) $(WARN) -g $(SAN) -o server server.c proto.c -lcrypt
 	$(CC) $(WARN) -g $(SAN) -o client client.c proto.c
+
+test: all
+	bash test.sh
 
 bench-run: bench
 	./bench > results.csv
